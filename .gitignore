@@ -1,0 +1,41 @@
+# editor settings
+.idea
+.vscode
+
+# datasets file
+datasets/
+data/
+
+# logs file
+logdir/
+
+# weights file
+weights/*
+weights_win/*
+weights_0227/*
+weights_0308/*
+weights_0314/*
+weights_0322/*
+weights_0326/*
+
+# onnx models
+*.onnx
+
+# python cache
+__pycache__/
+*.pyc
+
+# results file
+results/
+
+# external modules
+LiftFeat/
+HS-FPN/
+
+# old versions
+old/
+
+# tools file
+tools/
+
+3rdparty/Depth-Anything-V2/

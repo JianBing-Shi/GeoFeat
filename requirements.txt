@@ -1,0 +1,38 @@
+# Core Deep Learning
+torch
+torchvision
+pytorch-lightning
+tensorboard
+
+# Numerical & Computer Vision
+numpy
+opencv-python
+scipy
+matplotlib
+scikit-image
+pillow
+tqdm
+
+# Configuration & Utilities
+yacs
+setproctitle
+omegaconf
+addict
+h5py
+rich
+huggingface_hub
+
+# Geometry & Features (GeoFeat Specific)
+kornia
+einops
+torch-dct
+trimesh
+poselib
+pycolmap
+
+# 3rd Party Dependencies (ALIKE, Depth-Anything)
+timm
+albumentations
+evo
+gradio  # For Depth-Anything-V2 demo app
+gradio_imageslider # For Depth-Anything-V2 demo app
