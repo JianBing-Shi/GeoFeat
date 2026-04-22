@@ -609,7 +609,7 @@ class GCLA(nn.Module):
     def __init__(self, dim, geo_dim, geo_compress=16, k=3, k_scales=None):
         super().__init__()
         if k_scales is None:
-            k_scales = [3, 5, 7]  # Multi-scale receptive fields
+            k_scales = [3, 5]  # Multi-scale receptive fields
         
         self.dim = dim
         self.geo_compress = geo_compress
@@ -658,6 +658,8 @@ class GCLA(nn.Module):
         self.pw = nn.Conv2d(dim + geo_compress, dim, 1)
         self.norm = nn.LayerNorm(dim)
         self.act = nn.GELU()
+        # Learnable residual scale: start small to avoid destabilizing early training
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x, geo_map):
         residual = x
@@ -666,25 +668,25 @@ class GCLA(nn.Module):
         geo_feat = self.geo_proj(geo_map)
 
         # Multi-scale spatial aggregation: weighted combination of different receptive fields
-        f_spatial = sum(
-            w * conv(x)
-            for w, conv in zip(F.softmax(self.scale_weight_spatial, dim=0), self.dw_spatial_scales)
-        )
+        _ws = F.softmax(self.scale_weight_spatial, dim=0)
+        _f_spatial_list: list[torch.Tensor] = [w * conv(x) for w, conv in zip(_ws, self.dw_spatial_scales)]
+        f_spatial: torch.Tensor = torch.stack(_f_spatial_list).sum(dim=0)
 
         # Multi-scale geometric aggregation: weighted combination of different receptive fields
-        f_geo = sum(
-            w * conv(geo_feat)
-            for w, conv in zip(F.softmax(self.scale_weight_geo, dim=0), self.dw_geo_scales)
-        )
+        _wg = F.softmax(self.scale_weight_geo, dim=0)
+        _f_geo_list: list[torch.Tensor] = [w * conv(geo_feat) for w, conv in zip(_wg, self.dw_geo_scales)]
+        f_geo: torch.Tensor = torch.stack(_f_geo_list).sum(dim=0)
 
         # Learnable cross-modal coupling (replaces fixed addition)
         coupled = torch.cat([f_spatial, f_geo], dim=1)
         gates = self.coupling_gate(coupled)  # [B, 2, H, W]
         gate_spatial, gate_geo = gates[:, 0:1], gates[:, 1:2]
 
-        # Adaptive coupling: apply learned gates to cross-modal contributions
-        f_spatial = f_spatial + gate_geo * self.geo_to_spatial(f_geo)
-        f_geo = f_geo + gate_spatial * self.spatial_to_geo(f_spatial)
+        # Symmetric coupling: compute updates from pre-coupling values
+        spatial_update = gate_geo * self.geo_to_spatial(f_geo)
+        geo_update = gate_spatial * self.spatial_to_geo(f_spatial)
+        f_spatial = f_spatial + spatial_update
+        f_geo = f_geo + geo_update
 
         # Merge and project
         out = torch.cat([f_spatial, f_geo], dim=1)
@@ -694,7 +696,7 @@ class GCLA(nn.Module):
         out = out.permute(0, 3, 1, 2)
         out = self.act(out)
 
-        return residual + out
+        return residual + self.residual_scale * out
 
 class FeatureBooster(nn.Module):
 	def __init__(self, model_config, dropout=False, p=0.1):
