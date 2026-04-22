@@ -27,14 +27,13 @@ cfg.MODEL.DESCRIPTOR_ENCODER = [64, 64]
 
 # Normal, Gradient, and Curvature feature encoders
 cfg.MODEL.GEOMETRIC_FEATURES = CN()
-cfg.MODEL.GEOMETRIC_FEATURES.DEPTH = False
+cfg.MODEL.GEOMETRIC_FEATURES.DEPTH = True
 cfg.MODEL.GEOMETRIC_FEATURES.NORMAL = True
-cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS = False
-cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES = False
+cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS = True
+cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES = True
 
 cfg.MODEL.DEPTH_ENCODER = [128, 64, 64]
 cfg.MODEL.DEPTH_DIM = 64
-
 
 cfg.MODEL.NORMAL_ENCODER = [128, 64, 64]
 cfg.MODEL.NORMAL_DIM = 192
@@ -43,36 +42,20 @@ cfg.MODEL.GRADIENT_ENCODER = [64, 32, 32]
 cfg.MODEL.GRADIENT_DIM = 128
 
 cfg.MODEL.CURVATURE_ENCODER = [64, 32, 32]
-cfg.MODEL.CURVATURE_DIM = 320
-
-# cfg.MODEL.DEPTH_ENCODER = [128, 64, 64]
-# cfg.MODEL.DEPTH_DIM = 64
-
-
-# cfg.MODEL.NORMAL_ENCODER = [128, 64, 64]
-# cfg.MODEL.NORMAL_DIM = 192
-
-# cfg.MODEL.GRADIENT_ENCODER = [64, 32, 32]
-# cfg.MODEL.GRADIENT_DIM = 64
-
-# cfg.MODEL.CURVATURE_ENCODER = [64, 32, 32]
-# cfg.MODEL.CURVATURE_DIM = 160
-
-# Geometry UNFOLD is always enabled inside the model.
-cfg.MODEL.USE_FUSION_GATING = True
+cfg.MODEL.CURVATURE_DIM = 64
 
 # Geometry preprocessing mode before FeatureBooster:
 # - "unfold": original 8x8 unfold to tokenized geometry channels
 # - "no_unfold_lite": resize geometry map to descriptor resolution directly
-cfg.MODEL.GEO_PREPROCESS_MODE = "unfold"
+cfg.MODEL.GEO_PREPROCESS_MODE = "no_unfold_lite"
 
 # Attention configuration
 cfg.MODEL.ATTENTIONAL_LAYERS = 3
 
-# Refiner options: "None", "Local", "Geometric"
+# Refiner options: "None", "Local", "GCLA"
 # "Local" uses simple depthwise separable conv
-# "Geometric" uses geometry-guided refinement (Requires geometric features)
-cfg.MODEL.REFINER_TYPE = "None"
+# "GCLA" uses Geometric-Coupled Local Aggregation (Requires geometric features)
+cfg.MODEL.REFINER_TYPE = "GCLA"
 # 重复性图的权重系数，控制其对关键点预测的影响程度
 # ALPHA小：更依赖原始关键点预测；
 # ALPHA大：更依赖重复性图进行调整

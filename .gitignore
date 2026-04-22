@@ -17,6 +17,8 @@ weights_0308/*
 weights_0314/*
 weights_0322/*
 weights_0326/*
+weights_0401/*
+weights_0410/*
 
 # onnx models
 *.onnx
@@ -37,5 +39,3 @@ old/
 
 # tools file
 tools/
-
-3rdparty/Depth-Anything-V2/

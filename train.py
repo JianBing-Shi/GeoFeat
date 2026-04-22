@@ -20,7 +20,7 @@ def parse_arguments():
 
 	# training setting
 	# 保存权重
-	parser.add_argument('--ckpt_save_path', type=str, default='weights_win',
+	parser.add_argument('--ckpt_save_path', type=str, default='weights',
 						help='Path to save the checkpoints.')
 	# 训练步数
 	parser.add_argument('--n_steps', type=int, default=160_000,
@@ -108,8 +108,6 @@ class Trainer():
 		# Store configs
 		self.data_config = data_config
 		self.model_config = model_config
-
-		# Training strategy is intentionally kept in train.py (not config.py)
 		self.use_dual_kpt_loss = bool(use_dual_kpt_loss)
 		self.kpt_single_source = 'raw'
 		self.kpt_raw_weight_start = 0.8
@@ -257,7 +255,7 @@ class Trainer():
 		self.dry_run = dry_run
 		self.writer = SummaryWriter(logdir)
 		self.log_interval = log_interval
-		
+
 		# status 相关初始化
 		self.status_every = status_interval if status_interval > 0 else log_interval
 		self.status_path = os.path.join(self.run_dir, 'status.txt')
@@ -433,8 +431,8 @@ class Trainer():
 				
 				# import pdb;pdb.set_trace()
 				for b in range(len(imgs1_np)):
-					megadepth_depth1,megadepth_norm1=self.depth_net.extract(imgs1_np[b])
-					megadepth_depth2,megadepth_norm2=self.depth_net.extract(imgs2_np[b])
+					megadepth_depth1, megadepth_norm1, _, _ = self.depth_net.extract(imgs1_np[b])
+					megadepth_depth2, megadepth_norm2, _, _ = self.depth_net.extract(imgs2_np[b])
 					DA_normals1.append(megadepth_norm1);DA_normals2.append(megadepth_norm2)
 					DA_depths1.append(megadepth_depth1);DA_depths2.append(megadepth_depth2)
 					
@@ -523,13 +521,13 @@ class Trainer():
 					torch.save(self.net.state_dict(), ckpt_path)
 				
 				# 保存最佳权重文件
-				if acc_fb_coarse > best_acc:
-					best_acc = acc_fb_coarse
+				if acc_coarse > best_acc:
+					best_acc = acc_coarse
 					best_ckpt_path = os.path.join(self.ckpt_dir, f'{self.model_name}_{global_step}best.pth')
 					torch.save(self.net.state_dict(), best_ckpt_path)
 
 				# 打印训练过程(损失函数) - 使用 tqdm.write 分行输出详细信息，避免单行过长
-				pbar.set_description(f'Loss/total: {loss.item():.4f} Accuracy/acc_fb_coarse: {acc_fb_coarse:.3f}')
+				pbar.set_description(f'Loss/total: {loss.item():.4f} Accuracy/acc_coarse: {acc_coarse:.3f}')
 				pbar.update(1)
 				# 为什么修改打印训练过程 会该改变训练时间？
 				# tqdm 的 update(n) 方法只是进度条的计数器，它会让进度条前进n步。例如：
@@ -596,7 +594,7 @@ if __name__ == '__main__':
 
 
 	model_config = {
-		"backbone": cfg.MODEL.BACKBONE,									# 骨干网络
+		"backbone": str(cfg.MODEL.BACKBONE),									# 骨干网络
 		# 关键点编码器
 		'keypoint_encoder': list(cfg.MODEL.KEYPOINT_ENCODER),			# 关键点编码器
 		'keypoint_dim': int(cfg.MODEL.KEYPOINT_DIM),					# 关键点维度
@@ -623,17 +621,15 @@ if __name__ == '__main__':
 		# 曲率编码器
 		'curvature_encoder': list(cfg.MODEL.CURVATURE_ENCODER),
 		'curvature_dim': int(cfg.MODEL.CURVATURE_DIM),
-		# 是否使用门控机制融合几何特征
-		'use_fusion_gating': bool(cfg.MODEL.USE_FUSION_GATING),
 		# 几何预处理模式
 		'geo_preprocess_mode': str(cfg.MODEL.GEO_PREPROCESS_MODE),
 		# 重复性图融合权重
 		'repeatability_alpha': float(cfg.MODEL.REPEATABILITY_ALPHA),
 		# 注意力机制配置
-		"attention_layers": cfg.MODEL.ATTENTIONAL_LAYERS,
-		"refiner_type": cfg.MODEL.REFINER_TYPE,
+		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
+		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
 		# 细化匹配器配置
-		"last_activation": cfg.MODEL.LAST_ACTIVATION,
+		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		# 模型输出维度
 		'output_dim': int(cfg.MODEL.OUTPUT_DIM),
 	}
@@ -644,8 +640,8 @@ if __name__ == '__main__':
 		sys.exit(1)
 
 	# Strict guard: when REFINER_TYPE is enabled, all 3D geometric features must be on.
-	refiner_type = str(model_config.get('refiner_type', 'None')).strip().lower()
-	if refiner_type != 'none':
+	refiner_type = model_config['refiner_type']
+	if refiner_type != 'None':
 		geo_cfg = model_config.get('geometric_features', {})
 		required_geo = ('depth', 'normal', 'gradients', 'curvatures')
 		disabled_geo = [name for name in required_geo if not bool(geo_cfg.get(name, False))]

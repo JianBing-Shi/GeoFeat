@@ -280,34 +280,17 @@ class RepVGGBackbone(nn.Module):
 class UpsampleLayer(nn.Module):
 	def __init__(self, in_channels):
 		super().__init__()
-		# 定义特征提取层，减少通道数同时增加特征提取能�?
+		# 定义特征提取层，减少通道数同时增加特征提取能力
 		self.conv = nn.Conv2d(in_channels, in_channels//2, kernel_size=3, stride=1, padding=1)
-		# 使用BN�?
+		# 使用BN层
 		self.bn = nn.BatchNorm2d(in_channels//2)
-		# 使用LeakyReLU激活函�?
+		# 使用LeakyReLU激活函数
 		self.leaky_relu = nn.LeakyReLU(0.1)
 
 	def forward(self, x):
 		x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
 		x = self.leaky_relu(self.bn(self.conv(x)))
 
-		return x
-
-# ========== PixelShuffleUpsample ==========
-class PixelShuffleUpsample(nn.Module):
-	def __init__(self, in_channels, out_channels=None):
-		super().__init__()
-		if out_channels is None:
-			out_channels = in_channels // 2
-		# PixelShuffle 需要输入通道数为 out_channels * 4 (因为放大2�?
-		self.conv = nn.Conv2d(in_channels, out_channels * 4, kernel_size=3, stride=1, padding=1)
-		self.bn = nn.BatchNorm2d(out_channels * 4)
-		self.pixel_shuffle = nn.PixelShuffle(upscale_factor=2)
-		self.leaky_relu = nn.LeakyReLU(0.1)
-
-	def forward(self, x):
-		# Conv(C_in -> 4*C_out) -> BN -> ReLU -> PixelShuffle(4*C_out -> C_out)
-		x = self.leaky_relu(self.pixel_shuffle(self.bn(self.conv(x))))
 		return x
 
 # --------- Head Classes ---------
@@ -349,8 +332,7 @@ class KeypointHead(nn.Module):
 		x=self.layer5(x)
 		x=self.bn(self.conv(x))
 		return x
-	
-	
+
 class DescriptorHead(nn.Module):
 	def __init__(self,in_channels,out_channels):
 		super().__init__()
@@ -365,8 +347,7 @@ class DescriptorHead(nn.Module):
 		x=self.layer(x)
 		# x=nn.functional.softmax(x,dim=1)
 		return x
-	
-	
+
 class HeatmapHead(nn.Module):
 	def __init__(self,in_channels,mid_channels,out_channels):
 		super().__init__()
@@ -387,17 +368,25 @@ class GeoHead(nn.Module):
 	"""LiftFeat-style depth/geo head with dynamic channels and projection to desc dim."""
 	def __init__(self, in_channels: int, geo_cfg: dict):
 		super().__init__()
+		# Track branch names and per-branch channel counts for selective normalization
+		branch_defs = [
+			('depth', 1),
+			('normal', 3),
+			('gradients', 2),
+			('curvatures', 1),
+		]
+		self._branch_names = []
+		self._branch_channels = []
 		out_ch = 0
-		if geo_cfg['depth']:
-			out_ch += 1
-		if geo_cfg['normal']:
-			out_ch += 3
-		if geo_cfg['gradients']:
-			out_ch += 2
-		if geo_cfg['curvatures']:
-			out_ch += 5
+		for name, ch in branch_defs:
+			if geo_cfg[name]:
+				self._branch_names.append(name)
+				self._branch_channels.append(ch)
+				out_ch += ch
 		if out_ch == 0:
 			out_ch = 1  # fallback to avoid empty head
+			self._branch_names = ['depth']
+			self._branch_channels = [1]
 
 		self.out_channels = out_ch
 		# three-stage upsample like LiftFeat DepthHead
@@ -429,12 +418,15 @@ class GeoHead(nn.Module):
 		x3 = torch.cat([x2_0,x3],dim=1)
 		x = self.leaky_relu(self.bnDepc(self.convDepc(x3)))
 		
-		# x = F.normalize(x,p=2,dim=1) 
-		# Normalize if outputting normals (3 channels), otherwise keep as is appropriately.
-		# For LiftFeat parity when using Normal maps, normalization is crucial.
-		if self.out_channels == 3:
-			x = F.normalize(x, p=2, dim=1)
-		return x																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																								   
+		# Selective normalization: only normalize the normal branch
+		parts = x.split(self._branch_channels, dim=1)
+		out = []
+		for i, name in enumerate(self._branch_names):
+			p = parts[i]
+			if name == 'normal':
+				p = F.normalize(p, p=2, dim=1)
+			out.append(p)
+		return torch.cat(out, dim=1)																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																																								   
 
 # --------- Encoder Classes ---------
 def MLP(channels: List[int], do_bn: bool = False) -> nn.Module:
@@ -459,7 +451,6 @@ def MLP_no_ReLU(channels: List[int], do_bn: bool = False) -> nn.Module:
 			if do_bn:
 				layers.append(nn.BatchNorm1d(channels[i]))
 	return nn.Sequential(*layers)
-
 
 class KeypointEncoder(nn.Module):
 	""" Encoding of geometric properties using MLP """
@@ -565,16 +556,6 @@ class AFTBlock(nn.Module):
 		x = self.ffn(x)
 		return x
 
-# ---------------- Update AttentionalNN to support Swin ----------------
-# You can replace your existing AttentionalNN with the extended one below (keeps AFT support)
-
-# if cfg["attention_type"] == "AFT":
-# 	self.attn = AFTAttention(feature_dim, dropout=dropout, p=p)
-# 	if cfg["ffn_type"] == "PPN"
-# 		self.ffn = PositionwiseFeedForward(feature_dim, dropout=dropout, p=p)
-# 	elif cfg["ffn_type"] == "swigluFFN":
-# 		self.ffn = swigluFeedForward(feature_dim, dropout=dropout, p=p)
-
 class AttentionalNN(nn.Module):
 	def __init__(self, feature_dim: int, layer_num: int, model_config: dict, dropout: bool = False, p: float = 0.1) -> None:
 		super().__init__()
@@ -589,6 +570,7 @@ class AttentionalNN(nn.Module):
 			desc = layer(desc)
 		return desc
 
+# --------- LocalRefiner ---------
 # 通用特征增强模块，使用局部细化模块
 class LocalRefiner(nn.Module):
 	"""
@@ -613,132 +595,106 @@ class LocalRefiner(nn.Module):
 		x = self.pw(x)
 		return input_x + x
 
-# 增强版本的局部细化模块，加入几何引导
-class GeometricLocalRefiner(nn.Module):
-	"""
-	[Module 3] Geometric-Guided Local Refinement Module (Lightweight Version).
-	Uses a single-channel spatial gate derived from geometry to prevent feature bleeding.
-	Design for Real-Time Performance: Minimal extra FLOPs.
-	"""
-	def __init__(self, dim, geo_dim, k=3):
-		super().__init__()
-		# Lightweight Guide Head: geo_dim -> 8 -> 1
-		# Drastically reduces parameters compared to mapping to 'dim' (e.g. 128)
-		self.geo_guide = nn.Sequential(
-			nn.Conv2d(geo_dim, 8, kernel_size=1),   # Compress geometric info
-			nn.ReLU(inplace=True),
-			nn.Conv2d(8, 1, kernel_size=k, padding=k//2), # Generate Spatial Mask
-			nn.Sigmoid()                            # 0=Block (Edge), 1=Pass (Flat)
-		)
-		
-		# Standard Depthwise Separable Conv (Very fast)
-		self.dw = nn.Conv2d(dim, dim, kernel_size=k, stride=1, padding=k//2, groups=dim)
-		self.pw = nn.Conv2d(dim, dim, kernel_size=1)
-		self.act = nn.GELU()
-		
-		self.norm = nn.LayerNorm(dim)
+class GCLA(nn.Module):
+    """Geometric-Coupled Local Aggregation v2 (GCLA-v2).
+    
+    Enhanced version with:
+    - Multi-scale convolution towers (3x3, 5x5, 7x7)
+    - Learnable scale weighting
+    - Learnable cross-modal coupling gates (replacing fixed addition)
+    
+    Fuses 2D spatial features and 3D geometric features through
+    multi-scale parallel aggregation with adaptive inter-modal weighting.
+    """
+    def __init__(self, dim, geo_dim, geo_compress=16, k=3, k_scales=None):
+        super().__init__()
+        if k_scales is None:
+            k_scales = [3, 5, 7]  # Multi-scale receptive fields
+        
+        self.dim = dim
+        self.geo_compress = geo_compress
+        self.k_scales = k_scales
+        
+        # Compress geometric features for efficient local aggregation
+        self.geo_proj = nn.Sequential(
+            nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
+            nn.BatchNorm2d(geo_compress),
+            nn.GELU(),
+        )
+        
+        # Multi-scale depthwise convolutions for spatial features
+        self.dw_spatial_scales = nn.ModuleList([
+            nn.Conv2d(dim, dim, ks, padding=ks // 2, groups=dim)
+            for ks in k_scales
+        ])
+        
+        # Multi-scale depthwise convolutions for geometric features
+        self.dw_geo_scales = nn.ModuleList([
+            nn.Conv2d(geo_compress, geo_compress, ks, padding=ks // 2, groups=geo_compress)
+            for ks in k_scales
+        ])
+        
+        # Learnable scale weights for spatial and geometric branches
+        self.scale_weight_spatial = nn.Parameter(
+            torch.ones(len(k_scales)) / len(k_scales)
+        )
+        self.scale_weight_geo = nn.Parameter(
+            torch.ones(len(k_scales)) / len(k_scales)
+        )
+        
+        # Cross-modal coupling (3D to 2D and 2D to 3D)
+        self.geo_to_spatial = nn.Conv2d(geo_compress, dim, 1)
+        self.spatial_to_geo = nn.Conv2d(dim, geo_compress, 1)
+        
+        # Learnable coupling gates: how much to trust each modality's contribution
+        self.coupling_gate = nn.Sequential(
+            nn.Conv2d(dim + geo_compress, 32, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 2, 1),  # Output: [gate_spatial, gate_geo]
+            nn.Sigmoid(),
+        )
+        
+        # Output projection
+        self.pw = nn.Conv2d(dim + geo_compress, dim, 1)
+        self.norm = nn.LayerNorm(dim)
+        self.act = nn.GELU()
 
-	def forward(self, x, geo_map):
-		# x: (B, C, H, W) feature map from global attention
-		# geo_map: (B, GeoC, H, W) raw geometric features (e.g., depth, normal)
-		
-		residual = x
-		
-		# 1. Generate Gate (B, 1, H, W) - Computationally negligible
-		gate = self.geo_guide(geo_map)
-		
-		# 2. Gated Convolution
-		# "x * gate" applies the geometric constraint.
-		# If gate is 0 (edge), the convolution sees 0s, effectively stopping propagation over the edge.
-		x = self.dw(x * gate) 
-		
-		# 3. Pointwise & Activation
-		x = x.permute(0, 2, 3, 1) # NHWC
-		x = self.norm(x)
-		x = x.permute(0, 3, 1, 2) # NCHW
-		
-		x = self.act(x)
-		x = self.pw(x)
-		
-		return residual + x
+    def forward(self, x, geo_map):
+        residual = x
 
-# class SpatialGeometricGatedFusion(nn.Module):
-# 	"""
-# 	Metric Fusion Module: Spatially-aware Geometric Gating using local complexity estimates.
-# 	"""
-# 	def __init__(self, feature_dim, geo_dim):
-# 		super().__init__()
-# 		# Project geometry to feature space with spatial context
-# 		self.geo_proj = nn.Sequential(
-# 			nn.Conv2d(geo_dim, feature_dim, kernel_size=3, padding=1),
-# 			nn.InstanceNorm2d(feature_dim),
-# 			nn.GELU()
-# 		)
-		
-# 		# Generate complexity-aware gate
-# 		# Input: Visual Features (Context) + Geometric Features (Structure)
-# 		self.gate_generator = nn.Sequential(
-# 			nn.Conv2d(feature_dim * 2, feature_dim // 2, kernel_size=3, padding=1),
-# 			nn.GELU(),
-# 			nn.Conv2d(feature_dim // 2, 1, kernel_size=1),
-# 			nn.Sigmoid()
-# 		)
-		
-# 		# Refinement layer
-# 		self.fusion_conv = nn.Sequential(
-# 			nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
-# 			nn.InstanceNorm2d(feature_dim),
-# 			nn.GELU()
-# 		)
+        # Compress 3D geometric features
+        geo_feat = self.geo_proj(geo_map)
 
-# 	def forward(self, x, geo_map):
-# 		# x: [B, C, H, W] main visual features
-# 		# geo_map: [B, GeoC, H, W] raw geometric maps
-		
-# 		# Extract spatial geometric features
-# 		geo_feat = self.geo_proj(geo_map)
-		
-# 		# Compute reliability gate based on visual-geometric consistency
-# 		# High gate values -> Geometry is informative/reliable for this region
-# 		gate = self.gate_generator(torch.cat([x, geo_feat], dim=1))
-		
-# 		# Gated residual fusion
-# 		# We use the gate to modulate how much geometric info is injected
-# 		fused = x + self.fusion_conv(geo_feat * gate)
-		
-# 		return fused
+        # Multi-scale spatial aggregation: weighted combination of different receptive fields
+        f_spatial = sum(
+            w * conv(x)
+            for w, conv in zip(F.softmax(self.scale_weight_spatial, dim=0), self.dw_spatial_scales)
+        )
 
-class LightweightChannelSpatialFusion(nn.Module):
-	"""Lightweight channel+spatial gate for descriptor-geometry fusion."""
-	def __init__(self, feature_dim: int, reduction: int = 4):
-		super().__init__()
-		hidden = max(8, feature_dim // reduction)
-		self.channel_gate = nn.Sequential(
-			nn.Linear(feature_dim * 2, hidden),
-			nn.ReLU(inplace=True),
-			nn.Linear(hidden, feature_dim),
-			nn.Sigmoid(),
-		)
-		self.spatial_gate = nn.Sequential(
-			nn.Conv2d(2, 8, kernel_size=3, padding=1, bias=False),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(8, 1, kernel_size=1, bias=True),
-			nn.Sigmoid(),
-		)
-		self.geo_scale = nn.Parameter(torch.tensor(1.0))
+        # Multi-scale geometric aggregation: weighted combination of different receptive fields
+        f_geo = sum(
+            w * conv(geo_feat)
+            for w, conv in zip(F.softmax(self.scale_weight_geo, dim=0), self.dw_geo_scales)
+        )
 
-	def forward(self, desc: torch.Tensor, geo: torch.Tensor) -> torch.Tensor:
-		# desc/geo are NHWC tensors.
-		desc_pool = desc.mean(dim=(1, 2))
-		geo_pool = geo.mean(dim=(1, 2))
-		channel_mask = self.channel_gate(torch.cat([desc_pool, geo_pool], dim=-1)).unsqueeze(1).unsqueeze(1)
+        # Learnable cross-modal coupling (replaces fixed addition)
+        coupled = torch.cat([f_spatial, f_geo], dim=1)
+        gates = self.coupling_gate(coupled)  # [B, 2, H, W]
+        gate_spatial, gate_geo = gates[:, 0:1], gates[:, 1:2]
 
-		desc_spatial = desc.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)
-		geo_spatial = geo.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)
-		spatial_mask = self.spatial_gate(torch.cat([desc_spatial, geo_spatial], dim=1)).permute(0, 2, 3, 1)
+        # Adaptive coupling: apply learned gates to cross-modal contributions
+        f_spatial = f_spatial + gate_geo * self.geo_to_spatial(f_geo)
+        f_geo = f_geo + gate_spatial * self.spatial_to_geo(f_spatial)
 
-		gated_geo = geo * channel_mask * spatial_mask * self.geo_scale
-		return desc + gated_geo
+        # Merge and project
+        out = torch.cat([f_spatial, f_geo], dim=1)
+        out = self.pw(out)
+        out = out.permute(0, 2, 3, 1)
+        out = self.norm(out)
+        out = out.permute(0, 3, 1, 2)
+        out = self.act(out)
+
+        return residual + out
 
 class FeatureBooster(nn.Module):
 	def __init__(self, model_config, dropout=False, p=0.1):
@@ -757,7 +713,7 @@ class FeatureBooster(nn.Module):
 			'depth': 1,
 			'normal': 3,
 			'gradients': 2,
-			'curvatures': 5,
+			'curvatures': 1,
 		}
 		self.geo_encoders = nn.ModuleDict()
 		self.geo_branch_gates = nn.ModuleDict()
@@ -804,8 +760,6 @@ class FeatureBooster(nn.Module):
 				self.geo_specs.append((name, input_dim)) # Store raw_dim for slicing
 				geo_input_dim += input_dim
 
-		self.fusion_gate = LightweightChannelSpatialFusion(self.model_config['descriptor_dim']) if geo_input_dim > 0 else None
-
 		self.attn_proj = AttentionalNN(feature_dim=self.model_config['descriptor_dim'], layer_num=self.model_config['attention_layers'], model_config=self.model_config, dropout=dropout)
 		self.repeatability_head = nn.Sequential(
 			nn.Conv2d(self.model_config['descriptor_dim'], self.model_config['descriptor_dim'], kernel_size=3, padding=1, groups=self.model_config['descriptor_dim'], bias=False),
@@ -814,18 +768,18 @@ class FeatureBooster(nn.Module):
 		)
 
 		# [Refiner Integration] Select Refiner based on config
-		# Modes: 'None', 'Local', 'Geometric'
+		# Modes: 'None', 'Local', 'GCLA'
 		self.refiner_type = model_config['refiner_type']
 		if self.refiner_type == 'Local':
 			self.refiner = LocalRefiner(dim=self.model_config['descriptor_dim'])
-		elif self.refiner_type == 'Geometric':
-			# Use raw geo channels for the Conv2d input in GeometricLocalRefiner.
+		elif self.refiner_type == 'GCLA':
+			# Use raw geo channels for the Conv2d input in GCLA.
 			total_geo_channels = sum(
 				dim for name, dim in self.geo_raw_dims.items()
 				if model_config['geometric_features'][name]
 			)
-			
-			self.refiner = GeometricLocalRefiner(dim=self.model_config['descriptor_dim'], geo_dim=total_geo_channels * geo_token_mult)
+
+			self.refiner = GCLA(dim=self.model_config['descriptor_dim'], geo_dim=total_geo_channels * geo_token_mult)
 		else:
 			self.refiner = None
 
@@ -875,10 +829,7 @@ class FeatureBooster(nn.Module):
 			if self.use_dropout:
 				geo_encoded_sum = self.dropout(geo_encoded_sum)
 
-			if self.fusion_gate is not None:
-				fused_desc = self.fusion_gate(d_encoded, geo_encoded_sum)
-			else:
-				fused_desc = d_encoded + geo_encoded_sum
+			fused_desc = d_encoded + geo_encoded_sum
 		else:
 			fused_desc = d_encoded
 
@@ -891,13 +842,13 @@ class FeatureBooster(nn.Module):
 		desc_flat = self.attn_proj(desc_flat, shape=(H_curr, W_curr))
 		desc = desc_flat.reshape(B_curr, H_curr, W_curr, C_curr)
 
-		# 5. Local Geometric Refiner
+		# 5. Local Refiner / GCLA
 		# Convert back to NCHW for Conv2d based Refiner and final output
 		desc_map = desc.permute(0, 3, 1, 2)
 		if self.refiner is not None:
 			if self.refiner_type == 'Local':
 				desc_map = self.refiner(desc_map)
-			elif self.refiner_type == 'Geometric' and geo_v is not None:
+			elif self.refiner_type == 'GCLA' and geo_v is not None:
 				desc_map = self.refiner(desc_map, geo_v)
 
 		# Final projection / activation
@@ -910,7 +861,7 @@ class FeatureBooster(nn.Module):
 		repeatability_map = self.repeatability_head(desc_map)
 
 		return desc_map, repeatability_map
-	
+
 class GeoFeatModel(nn.Module):
 	def __init__(self, model_config):
 		super().__init__()
@@ -1009,14 +960,15 @@ class GeoFeatModel(nn.Module):
 		
 		return keypoint_map, des_map, geo_map
 	
-	def forward2(self, keypoint_map, des_map, geo_map, return_refined_keypoints: bool = False):
+	def forward2(self, keypoint_map, des_map, geo_map, return_refined_keypoints: bool = True):
 		# Pass feature maps directly to FeatureBooster (which now handles spatial dims)
 		# des_map: (B, C, H/8, W/8)
 		# geo_map:
 		# - unfold mode: (B, C_geo, H, W) -> (B, C_geo*64, H/8, W/8)
 		# - no_unfold_lite mode: resize to (B, C_geo, H/8, W/8)
 		# keypoint_map: (B, C_k, H/8, W/8)
-
+		# no_unfold 更好的根本原因不是"unfold 有害"，而是"你的几何特征已经使 unfold 变得多余"。
+		# unfold 是为 depth-only 场景设计的补偿机制，当你的特征集包含 normal/gradients/curvatures 这些微分几何量时，unfold 从"有用"变成了"冗余+干扰"。
 		if self.geo_preprocess_mode == 'unfold':
 			geo_map = self._unfold2d(geo_map, ws=8)
 		else:
@@ -1029,14 +981,6 @@ class GeoFeatModel(nn.Module):
 			
 		descs_refine, repeatability_map = self.attn_fusion(des_map, keypoint_map, geo_map)
 
-		# if repeatability_map.shape[-2:] != keypoint_map.shape[-2:]:
-		# 	repeatability_map = F.interpolate(
-		# 		repeatability_map,
-		# 		size=keypoint_map.shape[-2:],
-		# 		mode='bilinear',
-		# 		align_corners=False,
-		# 	)
-
 		repeatability_logits = self.repeatability_proj(repeatability_map)
 		alpha = float(self.repeatability_alpha)
 		keypoint_logits_refined = (1.0 - alpha) * keypoint_map + alpha * repeatability_logits
@@ -1047,9 +991,9 @@ class GeoFeatModel(nn.Module):
 	
 	def forward(self,x):
 		keypoint_map, des_map, geo_map = self.forward1(x)
-		descs_refine = self.forward2(keypoint_map, des_map, geo_map)
+		descs_refine = self.forward2(keypoint_map, des_map, geo_map, return_refined_keypoints=True)
 		return descs_refine, des_map, geo_map, keypoint_map
-	
+
 
 if __name__ == "__main__":
 	import sys
@@ -1088,17 +1032,15 @@ if __name__ == "__main__":
 		# 曲率编码器
 		'curvature_encoder': list(cfg.MODEL.CURVATURE_ENCODER),
 		'curvature_dim': int(cfg.MODEL.CURVATURE_DIM),
-		# 是否使用门控机制融合几何特征
-		'use_fusion_gating': bool(cfg.MODEL.USE_FUSION_GATING),
 		# 几何预处理模式
 		'geo_preprocess_mode': str(cfg.MODEL.GEO_PREPROCESS_MODE),
 		# 重复性图权重系数
 		'repeatability_alpha': float(cfg.MODEL.REPEATABILITY_ALPHA),
 		# 注意力机制配置
-		"attention_layers": cfg.MODEL.ATTENTIONAL_LAYERS,
-		"refiner_type": cfg.MODEL.REFINER_TYPE,
+		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
+		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
 		# 细化匹配器配置
-		"last_activation": cfg.MODEL.LAST_ACTIVATION,
+		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		# 模型输出维度
 		'output_dim': int(cfg.MODEL.OUTPUT_DIM),
 	}

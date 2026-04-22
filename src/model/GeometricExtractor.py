@@ -10,11 +10,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src.utils.depth_anything_wrapper import DepthAnythingExtractor
 
 # 计算高阶几何特征
-class CurvatureComputer(nn.Module):
+class GeometricComputer(nn.Module):
     """
     Compute geometric curvature features from depth maps.
     Calculates:
     - Gradients (grad_x, grad_y)
+    - Normal Vector (nx, ny, nz)
     - Principal Curvatures (k1, k2)
     - Gaussian Curvature (K)
     - Mean Curvature (H)
@@ -112,7 +113,7 @@ class GeometricExtractor(nn.Module):
         if 'geometric_features' not in model_config:
             raise KeyError("model_config must contain 'geometric_features'")
         self.geo_cfg = model_config['geometric_features']
-        self.curvature_computer = CurvatureComputer()
+        self.geometric_computer = GeometricComputer()
 
         # Initialize DepthAnythingExtractor
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -150,7 +151,7 @@ class GeometricExtractor(nn.Module):
                 for i in range(len(imgs_np)):
                     # Pass target size (H, W) to extract
                     target_size = (H, W)
-                    d, _ = self.depth_extractor.extract(imgs_np[i], target_size=target_size)
+                    d, _, _, _ = self.depth_extractor.extract(imgs_np[i], target_size=target_size)
                     depth_list.append(d)
                     # normal_list.append(n)
                 
@@ -160,15 +161,15 @@ class GeometricExtractor(nn.Module):
             elif isinstance(image, np.ndarray):
                 # Assume single numpy image (H, W, 3)
                 target_size = (image.shape[0], image.shape[1])
-                d, _ = self.depth_extractor.extract(image, target_size=target_size)
+                d, _, _, _ = self.depth_extractor.extract(image, target_size=target_size)
                 depth = d.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
                 # normal = n.permute(2, 0, 1).unsqueeze(0) # (1, 3, H, W)
             else:
                  raise ValueError("Image must be torch.Tensor or numpy.ndarray")
 
         # Compute 1-order (Gradients) and 2-order (Curvature) geometric features
-        # curvature_dict contains: grad_x, grad_y, k1, k2, gaussian_curv, mean_curv, shape_index
-        curvature_dict = self.curvature_computer(depth)
+        # geometric_dict contains: grad_x, grad_y, k1, k2, gaussian_curv, mean_curv, shape_index
+        geometric_dict = self.geometric_computer(depth)
         
         geo_features = {}
         
@@ -178,20 +179,20 @@ class GeometricExtractor(nn.Module):
 
         # 1-order
         if self.geo_cfg['normal']:
-            geo_features['normal'] = curvature_dict['normal']
+            geo_features['normal'] = geometric_dict['normal']
 
         # Gradients
         if self.geo_cfg['gradients']:
-            geo_features['grad_x'] = curvature_dict['grad_x']
-            geo_features['grad_y'] = curvature_dict['grad_y']
+            geo_features['grad_x'] = geometric_dict['grad_x']
+            geo_features['grad_y'] = geometric_dict['grad_y']
 
         # Curvatures
         if self.geo_cfg['curvatures']:
-            geo_features['k1'] = curvature_dict['k1']
-            geo_features['k2'] = curvature_dict['k2']
-            geo_features['gaussian_curv'] = curvature_dict['gaussian_curv']
-            geo_features['mean_curv'] = curvature_dict['mean_curv']
-            geo_features['shape_index'] = curvature_dict['shape_index']
+            geo_features['k1'] = geometric_dict['k1']
+            geo_features['k2'] = geometric_dict['k2']
+            geo_features['gaussian_curv'] = geometric_dict['gaussian_curv']
+            geo_features['mean_curv'] = geometric_dict['mean_curv']
+            geo_features['shape_index'] = geometric_dict['shape_index']
         
         return geo_features
 

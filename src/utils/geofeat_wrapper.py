@@ -34,7 +34,6 @@ REQUIRED_MODEL_CONFIG_KEYS = {
 	"gradient_dim",
 	"curvature_encoder",
 	"curvature_dim",
-	"use_fusion_gating",
 	"repeatability_alpha",
 	"attention_layers",
 	"refiner_type",

@@ -26,8 +26,11 @@ GeoFeat 首次系统性地引入了 0-2 阶几何信息，弥补了传统纹理�
 - **AFTAttention (Attention-Free Transformer)**: 
   采用高效的 AFT 机制替代传统 Self-Attention，在保持全局感受野的同时大幅降低计算复杂度，实现几何特征的全局交互。
 
-- **GeometricLocalRefiner**:
+- **GeometricLocalRefiner**:GCLA 几何耦合局部聚合（Geometric-Coupled Local Aggregation）
   专为几何特征设计的局部细化模块。利用深度可分离卷积 (Depthwise Separable Conv) 注入局部归纳偏置，防止特征在几何不连续处（如物体边缘）发生过度平滑。
+  发现门控有害：几何门控在匹配时间不对称，损害鲁棒性
+  提出加法耦合：用固定的映射函数替代门控，保证一致性
+  双向增强：2D <-> 3D 互相提供上下文，信息互补，提升几何感知能力
 
 ### 3. 高分辨率几何解耦 (High-Res Geometry Unfolding)
 

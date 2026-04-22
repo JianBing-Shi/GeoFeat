@@ -413,8 +413,8 @@ class Trainer():
 				# import pdb;pdb.set_trace()
 				# 通过MageDepth V2数据训练
 				for b in range(len(imgs1_np)):
-					megadepth_depth1, megadepth_norm1 = self.depth_net.extract(imgs1_np[b])
-					megadepth_depth2, megadepth_norm2 = self.depth_net.extract(imgs2_np[b])
+					megadepth_depth1, megadepth_norm1, _, _ = self.depth_net.extract(imgs1_np[b])
+					megadepth_depth2, megadepth_norm2, _, _ = self.depth_net.extract(imgs2_np[b])
 					DA_normals1.append(megadepth_norm1)
 					DA_normals2.append(megadepth_norm2)
 

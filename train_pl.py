@@ -29,7 +29,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from src.config.config import get_cfg_defaults
 from model.GeoFeatModel import GeoFeatModel
 from loss.loss import GeoFeatLoss
-from utils.depth_anything_wrapper import DepthAnythingExtractor
+from src.utils.depth_anything_wrapper import DepthAnythingExtractor
 from utils.alike_wrapper import ALikeExtractor
 
 from data.coco_augmentor import COCOAugmentor
@@ -408,8 +408,8 @@ class GeoFeatTrainer(pl.LightningModule):
 				if isinstance(img2_in, torch.Tensor):
 					img2_in = img2_in.cpu().numpy()
 
-				d1, n1 = self.depth_net.extract(img1_in)
-				d2, n2 = self.depth_net.extract(img2_in)
+				d1, n1, _, _ = self.depth_net.extract(img1_in)
+				d2, n2, _, _ = self.depth_net.extract(img2_in)
 				DA_normals1.append(n1)
 				DA_normals2.append(n2)
 				DA_depths1.append(d1)
@@ -520,11 +520,10 @@ if __name__ == '__main__':
 		'gradient_dim': int(cfg.MODEL.GRADIENT_DIM),
 		'curvature_encoder': list(cfg.MODEL.CURVATURE_ENCODER),
 		'curvature_dim': int(cfg.MODEL.CURVATURE_DIM),
-		'use_fusion_gating': bool(cfg.MODEL.USE_FUSION_GATING),
 		'repeatability_alpha': float(cfg.MODEL.REPEATABILITY_ALPHA),
-		"attention_layers": cfg.MODEL.ATTENTIONAL_LAYERS,
-		"refiner_type": cfg.MODEL.REFINER_TYPE,
-		"last_activation": cfg.MODEL.LAST_ACTIVATION,
+		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
+		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
+		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		'output_dim': int(cfg.MODEL.OUTPUT_DIM),
 		# Add batch sizes to model config for loss usage
 		'megadepth_batch_size': data_config['megadepth_batch_size'],

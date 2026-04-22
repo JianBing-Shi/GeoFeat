@@ -320,18 +320,17 @@ class DepthAnythingExtractor(nn.Module):
     
     # 深度提取
     @torch.inference_mode()
-    def extract(self, img, target_size=None, return_aux=False):
+    def extract(self, img, target_size=None):
         """
         Extract depth and normal from a single image.
         Args:
             img: numpy array (H, W, 3) BGR
             target_size: tuple (H, W) for output size. If None, uses self.process_size
-            return_aux: 是否额外返回 gradient_map 和 curvature_map
         Returns:
             depth_t: (H, W) tensor
             normal_map: (H, W, 3) tensor
-            gradient_map: (H, W, 2) tensor (when return_aux=True)
-            curvature_map: (H, W, 5) tensor (when return_aux=True)
+            gradient_map: (H, W, 2) tensor
+            curvature_map: (H, W, 5) tensor
         """
         # DA3 inference expects RGB images (numpy, PIL, or path)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -374,7 +373,6 @@ class DepthAnythingExtractor(nn.Module):
 
         # 向量梯度计算
         gradient_map = self.compute_gradient_map_torch(depth_t, 1.0, normalize=True)
-
         # 曲率计算
         curvature_map = self.compute_curvature_map_torch(depth_t, 1.0, normalize=True)
 

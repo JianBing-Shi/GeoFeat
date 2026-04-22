@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from model.GeometricExtractor import CurvatureComputer
+from model.GeometricExtractor import GeometricComputer
 
 def dual_softmax_loss(X, Y, temp = 0.2):
 	"""
@@ -176,7 +176,7 @@ class GeoFeatLoss(nn.Module):
 		
 		# device
 		self.dev=device
-		self.curvature_computer = CurvatureComputer().to(device)
+		self.curvature_computer = GeometricComputer().to(device)
 		self.circle_loss = LogCoshCircleLoss(m=0.25, gamma=64).to(device)
 		
 	
@@ -427,8 +427,8 @@ class GeoFeatLoss(nn.Module):
 			geo_dict['gradients'] = geo_map[:, geo_idx:geo_idx+2, :, :]
 			geo_idx += 2
 		if self.geo_config['curvatures']:
-			geo_dict['curvatures'] = geo_map[:, geo_idx:geo_idx+5, :, :]
-			geo_idx += 5
+			geo_dict['curvatures'] = geo_map[:, geo_idx:geo_idx+1, :, :]
+			geo_idx += 1
 		return geo_dict
 
 	def compute_geometric_loss(self, geo_features1, geo_features2, DA_depths1, DA_depths2, megadepth_batch_size):
@@ -546,26 +546,14 @@ class GeoFeatLoss(nn.Module):
 									F.l1_loss(pred_grad1[1:2].unsqueeze(0), feat_target1['grad_y']) + \
 									F.l1_loss(pred_grad2[0:1].unsqueeze(0), feat_target2['grad_x']) + \
 									F.l1_loss(pred_grad2[1:2].unsqueeze(0), feat_target2['grad_y']))
-						loss_grad_list.append(l_g.unsqueeze(0))
+						# Curvatures
+						if self.geo_config['curvatures']:
+							# Extract predicted curvatures (only mean curvature H1)
+							pred_curv1 = cur_geo1['curvatures'][b]  # shape (1, H, W)
+							pred_curv2 = cur_geo2['curvatures'][b]
 
-					# Curvatures
-					if self.geo_config['curvatures']:
-						# Extract predicted curvatures
-						# Order: k1, k2, gaussian, mean, shape_index
-						pred_curv1 = cur_geo1['curvatures'][b]
-						pred_curv2 = cur_geo2['curvatures'][b]
-						
-						l_c = self.lam_curvature * (F.l1_loss(pred_curv1[0:1].unsqueeze(0), feat_target1['k1']) + \
-									F.l1_loss(pred_curv1[1:2].unsqueeze(0), feat_target1['k2']) + \
-									F.l1_loss(pred_curv1[2:3].unsqueeze(0), feat_target1['gaussian_curv']) + \
-									F.l1_loss(pred_curv1[3:4].unsqueeze(0), feat_target1['mean_curv']) + \
-									F.l1_loss(pred_curv1[4:5].unsqueeze(0), feat_target1['shape_index']) + \
-									F.l1_loss(pred_curv2[0:1].unsqueeze(0), feat_target2['k1']) + \
-									F.l1_loss(pred_curv2[1:2].unsqueeze(0), feat_target2['k2']) + \
-									F.l1_loss(pred_curv2[2:3].unsqueeze(0), feat_target2['gaussian_curv']) + \
-									F.l1_loss(pred_curv2[3:4].unsqueeze(0), feat_target2['mean_curv']) + \
-									F.l1_loss(pred_curv2[4:5].unsqueeze(0), feat_target2['shape_index']))
-						loss_curv_list.append(l_c.unsqueeze(0))
+							l_c = self.lam_curvature * (F.l1_loss(pred_curv1.unsqueeze(0), feat_target1['mean_curv']) + F.l1_loss(pred_curv2.unsqueeze(0), feat_target2['mean_curv']))
+							loss_curv_list.append(l_c.unsqueeze(0))
 		
 		loss_depth = torch.cat(loss_depth_list).mean() if loss_depth_list else torch.tensor(0.0, device=self.dev)
 		loss_grad = torch.cat(loss_grad_list).mean() if loss_grad_list else torch.tensor(0.0, device=self.dev)
