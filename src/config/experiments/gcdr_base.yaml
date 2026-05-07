@@ -1,0 +1,18 @@
+# GCDR Base — Geo-Conditional Descriptor Refinement (pre-attention FiLM module)
+#
+# Replaces GCLA: geometry conditions descriptors BEFORE global attention
+# rather than patching at the end post-attention.
+#
+# Comparison target: gcla_v2_improved_gate48.yaml  (AUC@5=39.60)
+# Expected gain: +1~3 AUC@5 by eliminating L2-norm interference and
+#                early-conditioning bias
+
+MODEL:
+  REFINER_TYPE: "GCDR"
+
+  # GCDR knobs
+  GCDR:
+    GEO_COMPRESS: 8         # compress 7 geo channels → 8 before FiLM generation
+
+  # Keep geo preprocessing consistent with GCLA experiments
+  GEO_PREPROCESS_MODE: "no_unfold_lite"

@@ -1,0 +1,11 @@
+MODEL:
+  GEO_PREPROCESS_MODE: "no_unfold_lite"
+  REFINER_TYPE: "GCLA"
+  GCLA:
+    K_SCALES: [3, 5, 7]
+    GEO_COMPRESS: 16
+    USE_RESIDUAL_SCALE: false
+    RESIDUAL_INIT: 0.1
+    SYMMETRIC_COUPLING: false
+    USE_STACK_SUM: false
+    GATE_HIDDEN: 32

@@ -1,0 +1,17 @@
+# GCDR Reliability No-Loss Ablation
+#
+# Same structure as gcdr_reliability_guided.yaml, but removes the explicit
+# reliability supervision term to isolate whether gains come from the
+# reliability objective or only from the added gating capacity.
+
+MODEL:
+  REFINER_TYPE: "GCDR"
+  GEO_PREPROCESS_MODE: "no_unfold_lite"
+
+  GCDR:
+    GEO_COMPRESS: 16
+    RELIABILITY_HIDDEN: 16
+    GATE_FLOOR: 0.10
+    RELIABILITY_LOSS_WEIGHT: 0.0
+    RELIABILITY_CONSISTENCY_WEIGHT: 0.25
+    RELIABILITY_TARGET_SCALE: 6.0

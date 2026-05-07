@@ -136,10 +136,13 @@ class GeoFeatLoss(nn.Module):
 				lam_kpts=1,
 				lam_kpts_raw=1,
 				lam_heatmap=1,
+				lam_reliability=0.0,
 				lam_normals=1,
 				lam_depth=1,
 				lam_gradients=1,
 				lam_curvature=1,
+				reliability_consistency_weight=0.25,
+				reliability_target_scale=6.0,
 				depth_spvs=True, 
 				geo_config=None):
 		super().__init__()
@@ -150,11 +153,14 @@ class GeoFeatLoss(nn.Module):
 		self.lam_kpts=lam_kpts                    # refined关键点检测损失权重
 		self.lam_kpts_raw=lam_kpts_raw            # raw关键点检测损失权重
 		self.lam_heatmap=lam_heatmap              # 热力图损失权重
+		self.lam_reliability=lam_reliability      # 几何可靠性监督损失权重
 		self.lam_normals=lam_normals              # 法向量一致性损失权重
 		self.lam_depth=lam_depth                  # 深度估计损失权重
 		self.lam_gradients=lam_gradients          # 深度梯度损失权重
 		self.lam_curvature=lam_curvature          # 曲率一致性损失权重
 		self.depth_spvs=depth_spvs                # 是否启用深度监督
+		self.reliability_consistency_weight = float(reliability_consistency_weight)
+		self.reliability_target_scale = float(reliability_target_scale)
 		self.geo_config = geo_config if geo_config is not None else {}
 		
 		# 当前批次损失值
@@ -164,6 +170,7 @@ class GeoFeatLoss(nn.Module):
 		self.loss_kpts_raw=0        # raw关键点损失
 		self.loss_kpts_refined=0    # refined关键点损失
 		self.loss_heatmaps=0        # 热力图损失
+		self.loss_reliability=0     # 几何可靠性损失
 		self.loss_normals=0         # 法向量损失
 		self.loss_depths=0          # 深度损失
 		self.loss_gradients=0       # 梯度损失
@@ -344,6 +351,36 @@ class GeoFeatLoss(nn.Module):
 			
 		loss=torch.cat(loss,dim=-1).mean()
 		return loss
+
+	def compute_reliability_loss(self, reliability1, reliability2, pts, raw_conf_list, refined_conf_list):
+		"""Supervise reliability by the matching gain brought by refinement."""
+		if reliability1 is None or reliability2 is None:
+			return torch.tensor(0.0, device=self.dev)
+
+		loss = []
+		B, _, _, _ = reliability1.shape
+
+		for b in range(B):
+			pts1, pts2 = pts[b][:, :2], pts[b][:, 2:]
+			r1 = reliability1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()]
+			r2 = reliability2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()]
+
+			raw_conf = raw_conf_list[b].detach().to(device=r1.device, dtype=r1.dtype)
+			refined_conf = refined_conf_list[b].detach().to(device=r1.device, dtype=r1.dtype)
+			target = torch.sigmoid(self.reliability_target_scale * (refined_conf - raw_conf))
+
+			fit_term = 0.5 * (
+				F.smooth_l1_loss(r1, target) +
+				F.smooth_l1_loss(r2, target)
+			)
+			consistency_term = F.l1_loss(r1, r2)
+			loss_per = fit_term + self.reliability_consistency_weight * consistency_term
+			loss.append(loss_per.unsqueeze(0))
+
+		if len(loss) == 0:
+			return torch.tensor(0.0, device=self.dev)
+
+		return torch.cat(loss, dim=-1).mean()
 	
 	
 	def normal_loss(self,normal,target_normal):
@@ -569,6 +606,7 @@ class GeoFeatLoss(nn.Module):
 				DA_normals1,DA_normals2,
 				DA_depths1, DA_depths2,
 				megadepth_batch_size,coco_batch_size,
+				reliability1=None, reliability2=None,
 				raw_kpts1=None, raw_kpts2=None,
 				refined_kpts1=None, refined_kpts2=None,
 				use_dual_kpt_loss=False,
@@ -585,6 +623,16 @@ class GeoFeatLoss(nn.Module):
 		# import pdb;pdb.set_trace()
 		self.loss_descs,self.acc_coarse,conf_list=self.compute_descriptors_loss(descs1,descs2,pts)
 		self.loss_fb_descs,self.acc_fb_coarse,fb_conf_list=self.compute_descriptors_loss(fb_descs1,fb_descs2,pts)
+		if reliability1 is not None and reliability2 is not None and self.lam_reliability > 0:
+			self.loss_reliability = self.compute_reliability_loss(
+				reliability1,
+				reliability2,
+				pts,
+				conf_list,
+				fb_conf_list,
+			)
+		else:
+			self.loss_reliability = torch.tensor(0.0, device=self.dev)
 		
 		# keypoint loss: dual-branch (raw+refined) with fallback to single-branch
 		if refined_kpts1 is None:
@@ -643,6 +691,7 @@ class GeoFeatLoss(nn.Module):
 			'loss_kpts':self.loss_kpts,
 			'loss_kpts_raw':self.lam_kpts_raw * self.loss_kpts_raw,
 			'loss_kpts_refined':self.lam_kpts * self.loss_kpts_refined,
+			'loss_reliability': self.lam_reliability * self.loss_reliability,
 			'kpt_raw_weight':raw_w,
 			'kpt_refined_weight':refined_w,
 			'acc_kpt':self.acc_kpt,

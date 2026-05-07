@@ -595,108 +595,216 @@ class LocalRefiner(nn.Module):
 		x = self.pw(x)
 		return input_x + x
 
+
+class GCDR(nn.Module):
+	"""Geo-Conditional Descriptor Refinement with reliability-aware fusion.
+
+	Geometry first predicts a per-location reliability score, and that score
+	controls how strongly the FiLM modulation is allowed to change descriptors.
+	This turns GCDR from unconditional geometry injection into trust-aware fusion.
+	"""
+
+	def __init__(
+		self,
+		dim: int,
+		geo_dim: int,
+		geo_compress: int = 8,
+		reliability_hidden: int = 16,
+		gate_floor: float = 0.10,
+	):
+		super().__init__()
+		self.dim = dim
+		self.gate_floor = float(max(0.0, min(gate_floor, 1.0)))
+
+		self.geo_proj = nn.Sequential(
+			nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
+			nn.BatchNorm2d(geo_compress),
+			nn.GELU(),
+		)
+
+		self.film_gen = nn.Conv2d(geo_compress, dim * 2, 1)
+		nn.init.zeros_(self.film_gen.weight)
+		if self.film_gen.bias is not None:
+			nn.init.zeros_(self.film_gen.bias)
+
+		reliability_hidden = max(1, int(reliability_hidden))
+		self.reliability_head = nn.Sequential(
+			nn.Conv2d(dim + geo_compress, reliability_hidden, 1, bias=False),
+			nn.BatchNorm2d(reliability_hidden),
+			nn.GELU(),
+			nn.Conv2d(reliability_hidden, 1, 1),
+		)
+		rel_out = self.reliability_head[-1]
+		if isinstance(rel_out, nn.Conv2d):
+			nn.init.zeros_(rel_out.weight)
+			if rel_out.bias is not None:
+				nn.init.zeros_(rel_out.bias)
+
+		self.norm = nn.LayerNorm(dim)
+
+	def forward(self, desc: torch.Tensor, geo_v: torch.Tensor):
+		desc_map = desc.permute(0, 3, 1, 2)
+		geo_feat = self.geo_proj(geo_v)
+
+		reliability_logits = self.reliability_head(torch.cat([desc_map, geo_feat], dim=1))
+		reliability_map = torch.sigmoid(reliability_logits)
+		gate = self.gate_floor + (1.0 - self.gate_floor) * reliability_map
+
+		film = self.film_gen(geo_feat)
+		scale, shift = film.chunk(2, dim=1)
+		scale = torch.tanh(scale) * gate
+		shift = shift * gate
+
+		scale = scale.permute(0, 2, 3, 1)
+		shift = shift.permute(0, 2, 3, 1)
+
+		out = desc * (1.0 + scale) + shift
+		out = self.norm(out)
+		return out, reliability_map
+
+
 class GCLA(nn.Module):
-    """Geometric-Coupled Local Aggregation v2 (GCLA-v2).
-    
-    Enhanced version with:
-    - Multi-scale convolution towers (3x3, 5x5, 7x7)
-    - Learnable scale weighting
-    - Learnable cross-modal coupling gates (replacing fixed addition)
-    
-    Fuses 2D spatial features and 3D geometric features through
-    multi-scale parallel aggregation with adaptive inter-modal weighting.
-    """
-    def __init__(self, dim, geo_dim, geo_compress=16, k=3, k_scales=None):
-        super().__init__()
-        if k_scales is None:
-            k_scales = [3, 5]  # Multi-scale receptive fields
-        
-        self.dim = dim
-        self.geo_compress = geo_compress
-        self.k_scales = k_scales
-        
-        # Compress geometric features for efficient local aggregation
-        self.geo_proj = nn.Sequential(
-            nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
-            nn.BatchNorm2d(geo_compress),
-            nn.GELU(),
-        )
-        
-        # Multi-scale depthwise convolutions for spatial features
-        self.dw_spatial_scales = nn.ModuleList([
-            nn.Conv2d(dim, dim, ks, padding=ks // 2, groups=dim)
-            for ks in k_scales
-        ])
-        
-        # Multi-scale depthwise convolutions for geometric features
-        self.dw_geo_scales = nn.ModuleList([
-            nn.Conv2d(geo_compress, geo_compress, ks, padding=ks // 2, groups=geo_compress)
-            for ks in k_scales
-        ])
-        
-        # Learnable scale weights for spatial and geometric branches
-        self.scale_weight_spatial = nn.Parameter(
-            torch.ones(len(k_scales)) / len(k_scales)
-        )
-        self.scale_weight_geo = nn.Parameter(
-            torch.ones(len(k_scales)) / len(k_scales)
-        )
-        
-        # Cross-modal coupling (3D to 2D and 2D to 3D)
-        self.geo_to_spatial = nn.Conv2d(geo_compress, dim, 1)
-        self.spatial_to_geo = nn.Conv2d(dim, geo_compress, 1)
-        
-        # Learnable coupling gates: how much to trust each modality's contribution
-        self.coupling_gate = nn.Sequential(
-            nn.Conv2d(dim + geo_compress, 32, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 2, 1),  # Output: [gate_spatial, gate_geo]
-            nn.Sigmoid(),
-        )
-        
-        # Output projection
-        self.pw = nn.Conv2d(dim + geo_compress, dim, 1)
-        self.norm = nn.LayerNorm(dim)
-        self.act = nn.GELU()
-        # Learnable residual scale: start small to avoid destabilizing early training
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+	"""Geometric-Coupled Local Aggregation v2 (GCLA-v2).
+	
+	Enhanced version with:
+	- Multi-scale convolution towers (3x3, 5x5, 7x7)
+	- Learnable scale weighting
+	- Learnable cross-modal coupling gates (replacing fixed addition)
+	
+	Fuses 2D spatial features and 3D geometric features through
+	multi-scale parallel aggregation with adaptive inter-modal weighting.
+	"""
+	def __init__(
+		self,
+		dim,
+		geo_dim,
+		geo_compress=16,
+		k=3,
+		k_scales=None,
+		use_residual_scale=False,
+		residual_init=0.1,
+		symmetric_coupling=False,
+		use_stack_sum=False,
+		gate_hidden=32,
+	):
+		super().__init__()
+		if k_scales is None:
+			k_scales = [3, 5, 7]  # Multi-scale receptive fields
+		
+		self.dim = dim
+		self.geo_compress = geo_compress
+		self.k_scales = k_scales
+		self.symmetric_coupling = bool(symmetric_coupling)
+		self.use_stack_sum = bool(use_stack_sum)
+		gate_hidden = max(1, int(gate_hidden))
+		
+		# Compress geometric features for efficient local aggregation
+		self.geo_proj = nn.Sequential(
+			nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
+			nn.BatchNorm2d(geo_compress),
+			nn.GELU(),
+		)
+		
+		# Multi-scale depthwise convolutions for spatial features
+		self.dw_spatial_scales = nn.ModuleList([
+			nn.Conv2d(dim, dim, ks, padding=ks // 2, groups=dim)
+			for ks in k_scales
+		])
+		
+		# Multi-scale depthwise convolutions for geometric features
+		self.dw_geo_scales = nn.ModuleList([
+			nn.Conv2d(geo_compress, geo_compress, ks, padding=ks // 2, groups=geo_compress)
+			for ks in k_scales
+		])
+		
+		# Learnable scale weights for spatial and geometric branches
+		self.scale_weight_spatial = nn.Parameter(
+			torch.ones(len(k_scales)) / len(k_scales)
+		)
+		self.scale_weight_geo = nn.Parameter(
+			torch.ones(len(k_scales)) / len(k_scales)
+		)
+		
+		# Cross-modal coupling (3D to 2D and 2D to 3D)
+		self.geo_to_spatial = nn.Conv2d(geo_compress, dim, 1)
+		self.spatial_to_geo = nn.Conv2d(dim, geo_compress, 1)
+		
+		# Learnable coupling gates: how much to trust each modality's contribution
+		self.coupling_gate = nn.Sequential(
+			nn.Conv2d(dim + geo_compress, gate_hidden, 1),
+			nn.ReLU(inplace=True),
+			nn.Conv2d(gate_hidden, 2, 1),  # Output: [gate_spatial, gate_geo]
+			nn.Sigmoid(),
+		)
+		
+		# Output projection
+		self.pw = nn.Conv2d(dim + geo_compress, dim, 1)
+		self.norm = nn.LayerNorm(dim)
+		self.act = nn.GELU()
+		self.residual_scale = None
+		if use_residual_scale:
+			self.residual_scale = nn.Parameter(torch.tensor(float(residual_init)))
 
-    def forward(self, x, geo_map):
-        residual = x
+	def forward(self, x, geo_map):
+		residual = x
 
-        # Compress 3D geometric features
-        geo_feat = self.geo_proj(geo_map)
+		# Compress 3D geometric features
+		geo_feat = self.geo_proj(geo_map)
 
-        # Multi-scale spatial aggregation: weighted combination of different receptive fields
-        _ws = F.softmax(self.scale_weight_spatial, dim=0)
-        _f_spatial_list: list[torch.Tensor] = [w * conv(x) for w, conv in zip(_ws, self.dw_spatial_scales)]
-        f_spatial: torch.Tensor = torch.stack(_f_spatial_list).sum(dim=0)
+		# Multi-scale spatial aggregation: weighted combination of different receptive fields
+		spatial_weights = F.softmax(self.scale_weight_spatial, dim=0)
+		if self.use_stack_sum:
+			spatial_terms = [
+				w * conv(x)
+				for w, conv in zip(spatial_weights, self.dw_spatial_scales)
+			]
+			f_spatial = torch.stack(spatial_terms, dim=0).sum(dim=0)
+		else:
+			f_spatial = sum(
+				w * conv(x)
+				for w, conv in zip(spatial_weights, self.dw_spatial_scales)
+			)
 
-        # Multi-scale geometric aggregation: weighted combination of different receptive fields
-        _wg = F.softmax(self.scale_weight_geo, dim=0)
-        _f_geo_list: list[torch.Tensor] = [w * conv(geo_feat) for w, conv in zip(_wg, self.dw_geo_scales)]
-        f_geo: torch.Tensor = torch.stack(_f_geo_list).sum(dim=0)
+		# Multi-scale geometric aggregation: weighted combination of different receptive fields
+		geo_weights = F.softmax(self.scale_weight_geo, dim=0)
+		if self.use_stack_sum:
+			geo_terms = [
+				w * conv(geo_feat)
+				for w, conv in zip(geo_weights, self.dw_geo_scales)
+			]
+			f_geo = torch.stack(geo_terms, dim=0).sum(dim=0)
+		else:
+			f_geo = sum(
+				w * conv(geo_feat)
+				for w, conv in zip(geo_weights, self.dw_geo_scales)
+			)
 
-        # Learnable cross-modal coupling (replaces fixed addition)
-        coupled = torch.cat([f_spatial, f_geo], dim=1)
-        gates = self.coupling_gate(coupled)  # [B, 2, H, W]
-        gate_spatial, gate_geo = gates[:, 0:1], gates[:, 1:2]
+		# Learnable cross-modal coupling (replaces fixed addition)
+		coupled = torch.cat([f_spatial, f_geo], dim=1)
+		gates = self.coupling_gate(coupled)  # [B, 2, H, W]
+		gate_spatial, gate_geo = gates[:, 0:1], gates[:, 1:2]
 
-        # Symmetric coupling: compute updates from pre-coupling values
-        spatial_update = gate_geo * self.geo_to_spatial(f_geo)
-        geo_update = gate_spatial * self.spatial_to_geo(f_spatial)
-        f_spatial = f_spatial + spatial_update
-        f_geo = f_geo + geo_update
+		# Adaptive coupling: apply learned gates to cross-modal contributions
+		if self.symmetric_coupling:
+			spatial_update = gate_geo * self.geo_to_spatial(f_geo)
+			geo_update = gate_spatial * self.spatial_to_geo(f_spatial)
+			f_spatial = f_spatial + spatial_update
+			f_geo = f_geo + geo_update
+		else:
+			f_spatial = f_spatial + gate_geo * self.geo_to_spatial(f_geo)
+			f_geo = f_geo + gate_spatial * self.spatial_to_geo(f_spatial)
 
-        # Merge and project
-        out = torch.cat([f_spatial, f_geo], dim=1)
-        out = self.pw(out)
-        out = out.permute(0, 2, 3, 1)
-        out = self.norm(out)
-        out = out.permute(0, 3, 1, 2)
-        out = self.act(out)
+		# Merge and project
+		out = torch.cat([f_spatial, f_geo], dim=1)
+		out = self.pw(out)
+		out = out.permute(0, 2, 3, 1)
+		out = self.norm(out)
+		out = out.permute(0, 3, 1, 2)
+		out = self.act(out)
 
-        return residual + self.residual_scale * out
+		if self.residual_scale is not None:
+			return residual + self.residual_scale * out
+		return residual + out
 
 class FeatureBooster(nn.Module):
 	def __init__(self, model_config, dropout=False, p=0.1):
@@ -770,20 +878,45 @@ class FeatureBooster(nn.Module):
 		)
 
 		# [Refiner Integration] Select Refiner based on config
-		# Modes: 'None', 'Local', 'GCLA'
+		# Modes: 'None', 'Local', 'GCLA', 'GCDR'
 		self.refiner_type = model_config['refiner_type']
+		self.pre_attn_refiner = None  # Pre-attention refiner slot (GCDR)
+		total_geo_channels = sum(
+			dim for name, dim in self.geo_raw_dims.items()
+			if model_config['geometric_features'][name]
+		)
 		if self.refiner_type == 'Local':
 			self.refiner = LocalRefiner(dim=self.model_config['descriptor_dim'])
 		elif self.refiner_type == 'GCLA':
-			# Use raw geo channels for the Conv2d input in GCLA.
-			total_geo_channels = sum(
-				dim for name, dim in self.geo_raw_dims.items()
-				if model_config['geometric_features'][name]
+			gcla_cfg = dict(self.model_config.get('gcla_config', {}))
+			self.refiner = GCLA(
+				dim=self.model_config['descriptor_dim'],
+				geo_dim=total_geo_channels * geo_token_mult,
+				geo_compress=int(gcla_cfg.get('geo_compress', 16)),
+				k_scales=list(gcla_cfg.get('k_scales', [3, 5, 7])),
+				use_residual_scale=bool(gcla_cfg.get('use_residual_scale', False)),
+				residual_init=float(gcla_cfg.get('residual_init', 0.1)),
+				symmetric_coupling=bool(gcla_cfg.get('symmetric_coupling', False)),
+				use_stack_sum=bool(gcla_cfg.get('use_stack_sum', False)),
+				gate_hidden=int(gcla_cfg.get('gate_hidden', 32)),
 			)
-
-			self.refiner = GCLA(dim=self.model_config['descriptor_dim'], geo_dim=total_geo_channels * geo_token_mult)
-		else:
+		elif self.refiner_type == 'GCDR':
+			# GCDR inserts BEFORE AttentionalNN: geometry conditions descriptors
+			# early so attention builds on geometry-aware representations.
+			gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
+			self.pre_attn_refiner = GCDR(
+				dim=self.model_config['descriptor_dim'],
+				geo_dim=total_geo_channels * geo_token_mult,
+				geo_compress=int(gcdr_cfg.get('geo_compress', 8)),
+				reliability_hidden=int(gcdr_cfg.get('reliability_hidden', 16)),
+				gate_floor=float(gcdr_cfg.get('gate_floor', 0.10)),
+			)
 			self.refiner = None
+		else:
+			raise ValueError(
+				f"Unsupported REFINER_TYPE '{self.refiner_type}'. "
+				"Expected one of: 'None', 'Local', 'GCLA', 'GCDR'."
+			)
 
 		# Final activation
 		if self.model_config['last_activation'] == 'None':
@@ -800,6 +933,7 @@ class FeatureBooster(nn.Module):
 	def forward(self, desc, kpts, geo_v=None, shape=None):
 		# Assume inputs are always 4D dense maps: (B, C, H, W)
 		B, C, H, W = desc.shape
+		geo_reliability_map = None
 		
 		# Ensure geo_v matches desc spatial resolution
 		if geo_v is not None and (geo_v.shape[2] != H or geo_v.shape[3] != W):
@@ -836,6 +970,9 @@ class FeatureBooster(nn.Module):
 			fused_desc = d_encoded
 
 		# 3. LiftFeat baseline path: no keypoint encoder injection
+		# GCDR: pre-attention geometric conditioning (operates in NHWC format)
+		if self.pre_attn_refiner is not None and geo_v is not None:
+			fused_desc, geo_reliability_map = self.pre_attn_refiner(fused_desc, geo_v)
 		desc = fused_desc
 
 		# 4. Cross Attention Boosting
@@ -862,7 +999,11 @@ class FeatureBooster(nn.Module):
 		desc_map = F.normalize(desc_map, p=2, dim=1)
 		repeatability_map = self.repeatability_head(desc_map)
 
-		return desc_map, repeatability_map
+		aux_outputs = {}
+		if geo_reliability_map is not None:
+			aux_outputs['geo_reliability_map'] = geo_reliability_map
+
+		return desc_map, repeatability_map, aux_outputs
 
 class GeoFeatModel(nn.Module):
 	def __init__(self, model_config):
@@ -962,7 +1103,7 @@ class GeoFeatModel(nn.Module):
 		
 		return keypoint_map, des_map, geo_map
 	
-	def forward2(self, keypoint_map, des_map, geo_map, return_refined_keypoints: bool = True):
+	def forward2(self, keypoint_map, des_map, geo_map, return_refined_keypoints: bool = True, return_aux: bool = False):
 		# Pass feature maps directly to FeatureBooster (which now handles spatial dims)
 		# des_map: (B, C, H/8, W/8)
 		# geo_map:
@@ -981,11 +1122,19 @@ class GeoFeatModel(nn.Module):
 				align_corners=False,
 			)
 			
-		descs_refine, repeatability_map = self.attn_fusion(des_map, keypoint_map, geo_map)
+		descs_refine, repeatability_map, aux_outputs = self.attn_fusion(des_map, keypoint_map, geo_map)
 
 		repeatability_logits = self.repeatability_proj(repeatability_map)
 		alpha = float(self.repeatability_alpha)
 		keypoint_logits_refined = (1.0 - alpha) * keypoint_map + alpha * repeatability_logits
+
+		if return_aux:
+			aux_outputs = dict(aux_outputs)
+			aux_outputs['repeatability_map'] = repeatability_map
+			aux_outputs['keypoint_logits_refined'] = keypoint_logits_refined
+			if return_refined_keypoints:
+				return descs_refine, keypoint_logits_refined, aux_outputs
+			return descs_refine, aux_outputs
 
 		if return_refined_keypoints:
 			return descs_refine, keypoint_logits_refined
@@ -1041,6 +1190,23 @@ if __name__ == "__main__":
 		# 注意力机制配置
 		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
 		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
+		'gcla_config': {
+			'k_scales': list(cfg.MODEL.GCLA.K_SCALES),
+			'geo_compress': int(cfg.MODEL.GCLA.GEO_COMPRESS),
+			'use_residual_scale': bool(cfg.MODEL.GCLA.USE_RESIDUAL_SCALE),
+			'residual_init': float(cfg.MODEL.GCLA.RESIDUAL_INIT),
+			'symmetric_coupling': bool(cfg.MODEL.GCLA.SYMMETRIC_COUPLING),
+			'use_stack_sum': bool(cfg.MODEL.GCLA.USE_STACK_SUM),
+			'gate_hidden': int(cfg.MODEL.GCLA.GATE_HIDDEN),
+		},
+		'gcdr_config': {
+			'geo_compress': int(cfg.MODEL.GCDR.GEO_COMPRESS),
+			'reliability_hidden': int(cfg.MODEL.GCDR.RELIABILITY_HIDDEN),
+			'gate_floor': float(cfg.MODEL.GCDR.GATE_FLOOR),
+			'reliability_loss_weight': float(cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT),
+			'reliability_consistency_weight': float(cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT),
+			'reliability_target_scale': float(cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE),
+		},
 		# 细化匹配器配置
 		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		# 模型输出维度

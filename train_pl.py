@@ -11,6 +11,7 @@ import json
 import glob
 import tqdm
 import numpy as np
+from typing import cast
 
 # Add src to path for imports (compatible with original train.py structure)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -43,6 +44,8 @@ def parse_arguments():
 	parser = argparse.ArgumentParser(description="GeoFeat PL Training")
 	parser.add_argument('--name', type=str, default='GeoFeat', 
 					 	help='set process name')
+	parser.add_argument('--config_file', type=str, default='',
+					 	help='Optional YAML config path merged on top of default config.')
 	# 保存权重
 	parser.add_argument('--ckpt_save_path', type=str, default='weights_win',
 						help='Path to save the checkpoints.')
@@ -273,13 +276,20 @@ class GeoFeatTrainer(pl.LightningModule):
 		# Passing 'cpu' initially, will move to device automatically? 
 		# GeoFeatLoss stores device for tensor creation. capture it dynamically or pass property
 		# We'll handle device in forward logic or create loss in setup
+		gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
+		reliability_loss_weight = 0.0
+		if self.model_config.get('refiner_type') == 'GCDR':
+			reliability_loss_weight = float(gcdr_cfg.get('reliability_loss_weight', 1.0))
 		self.loss_fn_params = {
 			'lam_descs': 1,
 			'lam_fb_descs': 2,
 			'lam_kpts': 2,
 			'lam_heatmap': 1,
+			'lam_reliability': reliability_loss_weight,
 			'lam_gradients': 10,
 			'lam_curvature': 10,
+			'reliability_consistency_weight': float(gcdr_cfg.get('reliability_consistency_weight', 0.25)),
+			'reliability_target_scale': float(gcdr_cfg.get('reliability_target_scale', 6.0)),
 			'geo_config': geo_config
 		}
 		# Note: GeoFeatLoss takes 'device' in init. We delay instantiation or update it.
@@ -340,18 +350,24 @@ class GeoFeatTrainer(pl.LightningModule):
 		
 		# Batch forward2
 		# Need to unsqueeze? No, forward2 takes (B, C, H, W)
-		fb_feats1_batch, keypoint_map1_refined = self.net.forward2(
+		result1 = cast(tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]], self.net.forward2(
 			keypoint_map1,
 			des_feats1,
 			geo_feats1,
 			return_refined_keypoints=True,
-		)
-		fb_feats2_batch, keypoint_map2_refined = self.net.forward2(
+			return_aux=True,
+		))
+		fb_feats1_batch, keypoint_map1_refined, aux1 = result1
+		result2 = cast(tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]], self.net.forward2(
 			keypoint_map2,
 			des_feats2,
 			geo_feats2,
 			return_refined_keypoints=True,
-		)
+			return_aux=True,
+		))
+		fb_feats2_batch, keypoint_map2_refined, aux2 = result2
+		geo_reliability1 = aux1.get('geo_reliability_map') if isinstance(aux1, dict) else None
+		geo_reliability2 = aux2.get('geo_reliability_map') if isinstance(aux2, dict) else None
 		
 		# Split back to lists for loss function which expects lists often? 
 		# train.py appends to fb_feats1 lists then cats.
@@ -443,7 +459,13 @@ class GeoFeatTrainer(pl.LightningModule):
 			DA_normals1, DA_normals2,
 			DA_depths1, DA_depths2,
 			megadepth_batch_size=md_bs,
-			coco_batch_size=coco_bs
+			coco_batch_size=coco_bs,
+			reliability1=geo_reliability1,
+			reliability2=geo_reliability2,
+			raw_kpts1=keypoint_map1,
+			raw_kpts2=keypoint_map2,
+			refined_kpts1=keypoint_map1_refined,
+			refined_kpts2=keypoint_map2_refined
 		)
 		
 		# 5. Logging
@@ -453,6 +475,8 @@ class GeoFeatTrainer(pl.LightningModule):
 		loss_items.append(loss_info['loss_descs'].unsqueeze(0))
 		loss_items.append(loss_info['loss_fb_descs'].unsqueeze(0))
 		loss_items.append(loss_info['loss_kpts'].unsqueeze(0))
+		if self.model_config.get('refiner_type') == 'GCDR':
+			loss_items.append(loss_info['loss_reliability'].unsqueeze(0))
 		
 		# Add geometric losses if enabled (they are 0.0 tensors if not enabled in loss.py, 
 		# but let's follow geo_config to be precise or just add them if they are non-zero/enabled)
@@ -490,6 +514,8 @@ if __name__ == '__main__':
 	
 	# Load Config
 	cfg = get_cfg_defaults()
+	if args.config_file:
+		cfg.merge_from_file(args.config_file)
 	
 	data_config = {
 		'use_megadepth': bool(cfg.DATASET.USE_MEGADEPTH),
@@ -523,6 +549,24 @@ if __name__ == '__main__':
 		'repeatability_alpha': float(cfg.MODEL.REPEATABILITY_ALPHA),
 		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
 		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
+		'geo_preprocess_mode': str(cfg.MODEL.GEO_PREPROCESS_MODE),
+		'gcla_config': {
+			'k_scales': list(cfg.MODEL.GCLA.K_SCALES),
+			'geo_compress': int(cfg.MODEL.GCLA.GEO_COMPRESS),
+			'use_residual_scale': bool(cfg.MODEL.GCLA.USE_RESIDUAL_SCALE),
+			'residual_init': float(cfg.MODEL.GCLA.RESIDUAL_INIT),
+			'symmetric_coupling': bool(cfg.MODEL.GCLA.SYMMETRIC_COUPLING),
+			'use_stack_sum': bool(cfg.MODEL.GCLA.USE_STACK_SUM),
+			'gate_hidden': int(cfg.MODEL.GCLA.GATE_HIDDEN),
+		},
+		'gcdr_config': {
+			'geo_compress': int(cfg.MODEL.GCDR.GEO_COMPRESS),
+			'reliability_hidden': int(cfg.MODEL.GCDR.RELIABILITY_HIDDEN),
+			'gate_floor': float(cfg.MODEL.GCDR.GATE_FLOOR),
+			'reliability_loss_weight': float(cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT),
+			'reliability_consistency_weight': float(cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT),
+			'reliability_target_scale': float(cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE),
+		},
 		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		'output_dim': int(cfg.MODEL.OUTPUT_DIM),
 		# Add batch sizes to model config for loss usage

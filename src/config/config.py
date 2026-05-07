@@ -56,6 +56,25 @@ cfg.MODEL.ATTENTIONAL_LAYERS = 3
 # "Local" uses simple depthwise separable conv
 # "GCLA" uses Geometric-Coupled Local Aggregation (Requires geometric features)
 cfg.MODEL.REFINER_TYPE = "GCLA"
+# GCLA refiner knobs for config-driven experiments.
+# Baseline V2 defaults keep current behavior unchanged.
+cfg.MODEL.GCLA = CN()
+cfg.MODEL.GCLA.K_SCALES = [3, 5, 7]
+cfg.MODEL.GCLA.GEO_COMPRESS = 16
+cfg.MODEL.GCLA.USE_RESIDUAL_SCALE = False
+cfg.MODEL.GCLA.RESIDUAL_INIT = 0.1
+cfg.MODEL.GCLA.SYMMETRIC_COUPLING = False
+cfg.MODEL.GCLA.USE_STACK_SUM = False
+cfg.MODEL.GCLA.GATE_HIDDEN = 32
+# GCDR refiner knobs (Geo-Conditional Descriptor Refinement).
+# FiLM-style pre-attention conditioning; zero-overhead when REFINER_TYPE != 'GCDR'.
+cfg.MODEL.GCDR = CN()
+cfg.MODEL.GCDR.GEO_COMPRESS = 8      # geo compression channels (7->8 for no_unfold_lite)
+cfg.MODEL.GCDR.RELIABILITY_HIDDEN = 16
+cfg.MODEL.GCDR.GATE_FLOOR = 0.10
+cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT = 1.0
+cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT = 0.25
+cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE = 6.0
 # 重复性图的权重系数，控制其对关键点预测的影响程度
 # ALPHA小：更依赖原始关键点预测；
 # ALPHA大：更依赖重复性图进行调整

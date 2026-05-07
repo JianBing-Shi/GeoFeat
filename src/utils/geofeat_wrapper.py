@@ -167,12 +167,21 @@ class GeoFeat:
 		nms_kernel_size: int = 7,
 		match_min_cossim: float = 0.1,
 		match_ratio_thresh: float = 0.82,
+		descriptor_source: str = "refined",
+		keypoint_source: str = "refined",
 	):
 		self.device = device
 		self.top_k = top_k
 		self.detect_threshold = detect_threshold
 		self.match_min_cossim = match_min_cossim
 		self.match_ratio_thresh = match_ratio_thresh
+		self.descriptor_source = str(descriptor_source).lower()
+		self.keypoint_source = str(keypoint_source).lower()
+		valid_sources = {"raw", "refined"}
+		if self.descriptor_source not in valid_sources:
+			raise ValueError(f"descriptor_source must be one of {sorted(valid_sources)}, got {descriptor_source}")
+		if self.keypoint_source not in valid_sources:
+			raise ValueError(f"keypoint_source must be one of {sorted(valid_sources)}, got {keypoint_source}")
 		self.model_config = validate_model_config(model_config)
 
 		self.net = GeoFeatModel(self.model_config).to(self.device).eval()
@@ -220,7 +229,7 @@ class GeoFeat:
 		return heatmap
 
 	def _run_model_two_stage(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-		"""Run forward1 -> forward2 with strict output contract checks."""
+		"""Run forward1 -> forward2 and expose raw/refined ablations."""
 		stage1 = self.net.forward1(image)
 		if not isinstance(stage1, (tuple, list)) or len(stage1) < 3:
 			raise RuntimeError(
@@ -228,10 +237,17 @@ class GeoFeat:
 			)
 
 		kpt_logits = stage1[0]
-		descs_map = stage1[1]
+		descs_raw = stage1[1]
 		geo_feats = stage1[2]
+		raw_heatmap = self._build_heatmap_from_logits(kpt_logits)
+		raw_descs_map = F.normalize(descs_raw, p=2, dim=1)
 
-		stage2 = self.net.forward2(kpt_logits, descs_map, geo_feats, return_refined_keypoints=True)
+		need_refined_desc = self.descriptor_source == "refined"
+		need_refined_kpt = self.keypoint_source == "refined"
+		if not need_refined_desc and not need_refined_kpt:
+			return raw_descs_map, raw_heatmap
+
+		stage2 = self.net.forward2(kpt_logits, descs_raw, geo_feats, return_refined_keypoints=True)
 		if isinstance(stage2, (tuple, list)) and len(stage2) == 2:
 			descs_refined, kpt_logits_refined = stage2
 		else:
@@ -249,8 +265,8 @@ class GeoFeat:
 				f"Expected keypoint_logits_refined as [B, C, H, W], got shape={tuple(kpt_logits_refined.shape)}"
 			)
 
-		descs_map = F.normalize(descs_refined, p=2, dim=1)
-		heatmap = self._build_heatmap_from_logits(kpt_logits_refined)
+		descs_map = raw_descs_map if self.descriptor_source == "raw" else F.normalize(descs_refined, p=2, dim=1)
+		heatmap = raw_heatmap if self.keypoint_source == "raw" else self._build_heatmap_from_logits(kpt_logits_refined)
 		return descs_map, heatmap
 
 	@staticmethod

@@ -73,7 +73,7 @@ def tensor2bgr(t):
     
     return (result * 255).astype(np.uint8)
 
-def compute_pose_error(match_fn,data):
+def compute_pose_error(match_fn, data, pose_epipolar_error=4.0):
     result = {}
     
     with torch.no_grad():
@@ -105,7 +105,7 @@ def compute_pose_error(match_fn,data):
     result = {}
     conf = 0.99999
     
-    ret = estimate_pose(mkpts0, mkpts1, K0, K1, 4.0, conf)
+    ret = estimate_pose(mkpts0, mkpts1, K0, K1, pose_epipolar_error, conf)
     if ret is not None:
         R, t, inliers = ret
         t_err, R_err = relative_pose_error(T_0to1, R, t, ignore_gt_t_thr=0.0)

@@ -21,6 +21,17 @@ parser=argparse.ArgumentParser(description='MegaDepth dataset evaluation script'
 parser.add_argument('--name',type=str,default='GeoFeat',help='experiment name')
 parser.add_argument('--gpu',type=str,default='0',help='GPU ID')
 parser.add_argument('--weights', type=str, required=True, help='Path to GeoFeat checkpoint (.pth)')
+parser.add_argument('--top_k', type=int, default=4096, help='Maximum number of detected keypoints to keep.')
+parser.add_argument('--detect-threshold', type=float, default=0.05, help='Keypoint detection threshold.')
+parser.add_argument('--nms-kernel-size', type=int, default=7, help='NMS kernel size for keypoint detection.')
+parser.add_argument('--match-min-cossim', type=float, default=0.1, help='Minimum cosine similarity for accepting a match.')
+parser.add_argument('--match-ratio-thresh', type=float, default=0.82, help='Lowe-style ratio threshold for match filtering.')
+parser.add_argument('--pose-epipolar-error', type=float, default=4.0, help='Epipolar error threshold passed to relative pose estimation.')
+parser.add_argument('--descriptor-source', type=str, default='refined', choices=['raw', 'refined'], help='Descriptor source used at evaluation time.')
+parser.add_argument('--keypoint-source', type=str, default='refined', choices=['raw', 'refined'], help='Keypoint heatmap source used at evaluation time.')
+parser.add_argument('--compare-sources', action='store_true', help='Evaluate all raw/refined descriptor-keypoint source combinations.')
+parser.add_argument('--preset', type=str, default='none', choices=['none', 'gcdr_noloss_auc5_boost'], help='Apply an evaluation preset before building the wrapper.')
+parser.add_argument('--save-json', type=str, default='', help='Optional path to save evaluation summaries as JSON.')
 args=parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu

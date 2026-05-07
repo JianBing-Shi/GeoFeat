@@ -1,0 +1,18 @@
+# GCDR Reliability-Guided Descriptor Refinement
+#
+# Paper-oriented variant:
+# - geometry first predicts a reliability map
+# - reliability gates descriptor modulation strength
+# - reliability is supervised by the matching gain over raw descriptors
+
+MODEL:
+  REFINER_TYPE: "GCDR"
+  GEO_PREPROCESS_MODE: "no_unfold_lite"
+
+  GCDR:
+    GEO_COMPRESS: 16
+    RELIABILITY_HIDDEN: 16
+    GATE_FLOOR: 0.10
+    RELIABILITY_LOSS_WEIGHT: 1.0
+    RELIABILITY_CONSISTENCY_WEIGHT: 0.25
+    RELIABILITY_TARGET_SCALE: 6.0

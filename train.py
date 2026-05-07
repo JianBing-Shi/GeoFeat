@@ -7,6 +7,7 @@ import argparse
 import os
 import time
 import sys
+from typing import cast
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -17,6 +18,8 @@ from src.config.config import get_cfg_defaults
 def parse_arguments():
 	parser = argparse.ArgumentParser(description="GeoFeat training script.")
 	parser.add_argument('--name', type=str, default='GeoFeat', help='set process name')
+	parser.add_argument('--config_file', type=str, default='',
+						help='Optional YAML config path merged on top of default config.')
 
 	# training setting
 	# 保存权重
@@ -132,9 +135,26 @@ class Trainer():
 
 		# training model - Pass model config to GeoFeatModel
 		self.net = GeoFeatModel(model_config=self.model_config).to(self.dev)
+		refiner_type = str(self.model_config.get('refiner_type', 'None'))
+		if refiner_type == 'GCDR':
+			if getattr(self.net.attn_fusion, 'pre_attn_refiner', None) is None:
+				raise RuntimeError(
+					"Config requests REFINER_TYPE='GCDR', but model.attn_fusion.pre_attn_refiner is None. "
+					"Please verify that server GeoFeatModel.py includes the GCDR branch."
+				)
+		if refiner_type == 'GCLA':
+			if getattr(self.net.attn_fusion, 'refiner', None) is None:
+				raise RuntimeError(
+					"Config requests REFINER_TYPE='GCLA', but model.attn_fusion.refiner is None. "
+					"Please verify GCLA branch wiring in GeoFeatModel.py."
+				)
 		
 		# Extract geometric config (validated in __main__)
 		geo_config = self.model_config['geometric_features']
+		gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
+		reliability_loss_weight = 0.0
+		if refiner_type == 'GCDR':
+			reliability_loss_weight = float(gcdr_cfg.get('reliability_loss_weight', 1.0))
 
 		self.loss_fn = GeoFeatLoss(
 			self.dev, 
@@ -143,8 +163,11 @@ class Trainer():
 			lam_kpts=2, 
 			lam_kpts_raw=2,
 			lam_heatmap=1,
+			lam_reliability=reliability_loss_weight,
 			lam_gradients=10,     # [重点] 放大梯度损失，关注边缘细节
 			lam_curvature=10,     # [重点] 放大曲率损失，关注形状细节
+			reliability_consistency_weight=float(gcdr_cfg.get('reliability_consistency_weight', 0.25)),
+			reliability_target_scale=float(gcdr_cfg.get('reliability_target_scale', 6.0)),
 			geo_config=geo_config
 		)
 
@@ -266,7 +289,7 @@ class Trainer():
 				f.write('global_step,loss,' \
 						'loss_descs,acc_coarse,' \
 						'loss_fb_descs,acc_fb_coarse,' \
-						'loss_kpts,loss_kpts_raw,loss_kpts_refined,kpt_raw_weight,kpt_refined_weight,' \
+						'loss_kpts,loss_kpts_raw,loss_kpts_refined,loss_reliability,kpt_raw_weight,kpt_refined_weight,' \
 						'loss_depths,loss_normals,loss_gradients,loss_curvature,' \
 						'total_pos,lr,forward_cost\n')
 			print(f"Status file initialized: {self.status_path}")
@@ -401,26 +424,35 @@ class Trainer():
 				# import pdb;pdb.set_trace()
 
 				fb_feats1,fb_feats2=[],[]
+				geo_reliability1, geo_reliability2 = [], []
 				kpt_maps1_refined, kpt_maps2_refined = [], []
 				for b in range(des_feats1.shape[0]):
 					feat1=des_feats1[b].permute(1,2,0).reshape(-1,des_feats1.shape[1])
 					feat2=des_feats2[b].permute(1,2,0).reshape(-1,des_feats2.shape[1])
 					
-					fb_feat1, kpt_refined1 = self.net.forward2(
+					result1 = cast(tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]], self.net.forward2(
 						keypoint_map1[b].unsqueeze(0),
 						des_feats1[b].unsqueeze(0),
 						geo_feats1[b].unsqueeze(0),
 						return_refined_keypoints=True,
-					)
-					fb_feat2, kpt_refined2 = self.net.forward2(
+						return_aux=True,
+					))
+					fb_feat1, kpt_refined1, aux1 = result1
+					result2 = cast(tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]], self.net.forward2(
 						keypoint_map2[b].unsqueeze(0),
 						des_feats2[b].unsqueeze(0),
 						geo_feats2[b].unsqueeze(0),
 						return_refined_keypoints=True,
-					)
+						return_aux=True,
+					))
+					fb_feat2, kpt_refined2, aux2 = result2
 					
 					fb_feats1.append(fb_feat1);fb_feats2.append(fb_feat2)
 					kpt_maps1_refined.append(kpt_refined1);kpt_maps2_refined.append(kpt_refined2)
+					if 'geo_reliability_map' in aux1:
+						geo_reliability1.append(aux1['geo_reliability_map'])
+					if 'geo_reliability_map' in aux2:
+						geo_reliability2.append(aux2['geo_reliability_map'])
 					
 					img1,img2=imgs1_t[b],imgs2_t[b]
 					img1=img1.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
@@ -439,6 +471,8 @@ class Trainer():
 				# import pdb;pdb.set_trace()
 				fb_feats1=torch.cat(fb_feats1,dim=0)
 				fb_feats2=torch.cat(fb_feats2,dim=0)
+				geo_reliability1 = torch.cat(geo_reliability1, dim=0) if geo_reliability1 else None
+				geo_reliability2 = torch.cat(geo_reliability2, dim=0) if geo_reliability2 else None
 				keypoint_map1_refined = torch.cat(kpt_maps1_refined, dim=0)
 				keypoint_map2_refined = torch.cat(kpt_maps2_refined, dim=0)
 				# Flattening/Reshaping removed as forward2 now returns (B, C, H, W) maps directly
@@ -459,6 +493,8 @@ class Trainer():
 					DA_normals1, DA_normals2,                                  	# MegaDepth法向量
 					DA_depths1, DA_depths2,                                    	# MegaDepth深度
 					self.megadepth_batch_size, self.coco_batch_size,
+					reliability1=geo_reliability1,
+					reliability2=geo_reliability2,
 					raw_kpts1=keypoint_map1,
 					raw_kpts2=keypoint_map2,
 					refined_kpts1=keypoint_map1_refined,
@@ -477,6 +513,7 @@ class Trainer():
 				loss_kpts = loss_info['loss_kpts']
 				loss_kpts_raw = loss_info.get('loss_kpts_raw', torch.tensor(0.0, device=self.dev))
 				loss_kpts_refined = loss_info.get('loss_kpts_refined', torch.tensor(0.0, device=self.dev))
+				loss_reliability = loss_info.get('loss_reliability', torch.tensor(0.0, device=self.dev))
 				kpt_raw_weight = float(loss_info.get('kpt_raw_weight', kpt_raw_weight))
 				kpt_refined_weight = float(loss_info.get('kpt_refined_weight', kpt_refined_weight))
 				acc_kpt = loss_info['acc_kpt']
@@ -489,6 +526,8 @@ class Trainer():
 				loss_items.append(loss_descs.unsqueeze(0))      # 描述子损失
 				loss_items.append(loss_fb_descs.unsqueeze(0))   # 增强描述子损失
 				loss_items.append(loss_kpts.unsqueeze(0))       # 关键点损失
+				if self.model_config.get('refiner_type') == 'GCDR':
+					loss_items.append(loss_reliability.unsqueeze(0))
 				
 				# Add geometric losses if enabled
 				geo_config = self.model_config['geometric_features']
@@ -545,6 +584,7 @@ class Trainer():
 				self.writer.add_scalar('Loss/kpts', loss_kpts.item(), global_step)
 				self.writer.add_scalar('Loss/kpts_raw', loss_kpts_raw.item(), global_step)
 				self.writer.add_scalar('Loss/kpts_refined', loss_kpts_refined.item(), global_step)
+				self.writer.add_scalar('Loss/reliability', loss_reliability.item(), global_step)
 				self.writer.add_scalar('Loss/kpt_raw_weight', kpt_raw_weight, global_step)
 				self.writer.add_scalar('Loss/kpt_refined_weight', kpt_refined_weight, global_step)
 				self.writer.add_scalar('Loss/depths', loss_depths.item(), global_step)
@@ -559,7 +599,7 @@ class Trainer():
 						f.write(f"{global_step},{loss.item():.6f},"
 								f"{loss_descs.item():.6f},{acc_coarse:.4f},"
 								f"{loss_fb_descs.item():.6f},{acc_fb_coarse:.4f},"
-								f"{loss_kpts.item():.6f},{loss_kpts_raw.item():.6f},{loss_kpts_refined.item():.6f},{kpt_raw_weight:.4f},{kpt_refined_weight:.4f},"
+								f"{loss_kpts.item():.6f},{loss_kpts_raw.item():.6f},{loss_kpts_refined.item():.6f},{loss_reliability.item():.6f},{kpt_raw_weight:.4f},{kpt_refined_weight:.4f},"
 								f"{loss_depths.item():.6f},{loss_normals.item():.6f},{loss_gradients.item():.6f},{loss_curvature.item():.6f},"
 								f"{total_pos},{self.opt.param_groups[0]['lr']:.6e},{end-start:.3f}\n")
 
@@ -569,6 +609,8 @@ if __name__ == '__main__':
 
 	# Load configs from config.py (yacs) and adapt to Trainer expectations
 	cfg = get_cfg_defaults()
+	if args.config_file:
+		cfg.merge_from_file(args.config_file)
 
 	data_config = {
 		'use_megadepth': bool(cfg.DATASET.USE_MEGADEPTH),
@@ -628,6 +670,23 @@ if __name__ == '__main__':
 		# 注意力机制配置
 		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
 		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
+		'gcla_config': {
+			'k_scales': list(cfg.MODEL.GCLA.K_SCALES),
+			'geo_compress': int(cfg.MODEL.GCLA.GEO_COMPRESS),
+			'use_residual_scale': bool(cfg.MODEL.GCLA.USE_RESIDUAL_SCALE),
+			'residual_init': float(cfg.MODEL.GCLA.RESIDUAL_INIT),
+			'symmetric_coupling': bool(cfg.MODEL.GCLA.SYMMETRIC_COUPLING),
+			'use_stack_sum': bool(cfg.MODEL.GCLA.USE_STACK_SUM),
+			'gate_hidden': int(cfg.MODEL.GCLA.GATE_HIDDEN),
+		},
+		'gcdr_config': {
+			'geo_compress': int(cfg.MODEL.GCDR.GEO_COMPRESS),
+			'reliability_hidden': int(cfg.MODEL.GCDR.RELIABILITY_HIDDEN),
+			'gate_floor': float(cfg.MODEL.GCDR.GATE_FLOOR),
+			'reliability_loss_weight': float(cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT),
+			'reliability_consistency_weight': float(cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT),
+			'reliability_target_scale': float(cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE),
+		},
 		# 细化匹配器配置
 		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		# 模型输出维度
