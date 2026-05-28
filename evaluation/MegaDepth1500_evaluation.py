@@ -37,7 +37,7 @@ args=parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
 sys.path.append(os.path.join(os.path.dirname(__file__),'../'))
-from src.utils.geofeat_wrapper import GeoFeat
+from src.utils.geofeat_wrapper import GeoFeat, load_model_config_for_weights
 from evaluation.eval_utils import *
 
 from torch.utils.data import Dataset,DataLoader
@@ -97,44 +97,96 @@ class MegaDepth1500(Dataset):
 
         return data
 
+def apply_eval_preset(parsed_args):
+    if parsed_args.preset == 'gcdr_noloss_auc5_boost':
+        if parsed_args.top_k == 4096:
+            parsed_args.top_k = 4096
+        if parsed_args.detect_threshold == 0.05:
+            parsed_args.detect_threshold = 0.03
+        if parsed_args.match_min_cossim == 0.1:
+            parsed_args.match_min_cossim = 0.05
+        if parsed_args.match_ratio_thresh == 0.82:
+            parsed_args.match_ratio_thresh = 0.88
+        if parsed_args.pose_epipolar_error == 4.0:
+            parsed_args.pose_epipolar_error = 2.5
+    return parsed_args
 
-def normalize_model_config(model_config: dict) -> dict:
-    cfg = dict(model_config)
-    if 'repeatability_alpha' not in cfg:
-        cfg['repeatability_alpha'] = 0.0
-        print("Warning: model_config missing 'repeatability_alpha'; fallback to 0.0.")
-    return cfg
 
-if __name__ == "__main__":
-    weights = os.path.abspath(args.weights)
-    snapshot_path = os.path.join(os.path.dirname(weights), 'config_snapshot.json')
-    if not os.path.exists(snapshot_path):
-        raise FileNotFoundError(f"No config_snapshot.json found at {snapshot_path}")
-
-    with open(snapshot_path, 'r') as f:
-        snap = json.load(f)
-    model_config = normalize_model_config(snap.get('model_config', snap))
-
-    geofeat = GeoFeat(model_config=model_config, weight_path=weights)
-    
-    dataset = MegaDepth1500(json_file = DATASET_JSON, root_dir = DATASET_ROOT)
+def evaluate_once(dataset, weights, model_config, descriptor_source, keypoint_source):
+    geofeat = GeoFeat(
+        model_config=model_config,
+        weight_path=weights,
+        top_k=args.top_k,
+        detect_threshold=args.detect_threshold,
+        nms_kernel_size=args.nms_kernel_size,
+        match_min_cossim=args.match_min_cossim,
+        match_ratio_thresh=args.match_ratio_thresh,
+        descriptor_source=descriptor_source,
+        keypoint_source=keypoint_source,
+    )
 
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
-
-    metrics = {}
-    R_errs = []
-    t_errs = []
-    inliers = []
-    
-    results=[]
-
-    cur_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    results = []
 
     for d in tqdm.tqdm(loader, desc="processing"):
-        error_infos = compute_pose_error(geofeat.match_featnet,d)
+        error_infos = compute_pose_error(
+            geofeat.match_featnet,
+            d,
+            pose_epipolar_error=args.pose_epipolar_error,
+        )
         results.append(error_infos)
-            
-    print(f'\n==={cur_time}==={args.name}===')
-    d_err_auc,errors=compute_maa(results)
-    for s_k,s_v in d_err_auc.items():
-        print(f'{s_k}: {s_v*100}')
+
+    d_err_auc, errors = compute_maa(results)
+    return d_err_auc, errors
+
+if __name__ == "__main__":
+    args = apply_eval_preset(args)
+    weights = os.path.abspath(args.weights)
+    model_config = load_model_config_for_weights(weights)
+    
+    dataset = MegaDepth1500(json_file = DATASET_JSON, root_dir = DATASET_ROOT)
+    cur_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    source_pairs = [(args.descriptor_source, args.keypoint_source)]
+    if args.compare_sources:
+        source_pairs = [
+            ('raw', 'raw'),
+            ('raw', 'refined'),
+            ('refined', 'raw'),
+            ('refined', 'refined'),
+        ]
+
+    summaries = []
+    for descriptor_source, keypoint_source in source_pairs:
+        d_err_auc, errors = evaluate_once(
+            dataset=dataset,
+            weights=weights,
+            model_config=model_config,
+            descriptor_source=descriptor_source,
+            keypoint_source=keypoint_source,
+        )
+        summary = {
+            'descriptor_source': descriptor_source,
+            'keypoint_source': keypoint_source,
+            'metrics': {k: v * 100 for k, v in d_err_auc.items()},
+            'num_pairs': int(len(errors)),
+            'eval_args': {
+                'top_k': args.top_k,
+                'detect_threshold': args.detect_threshold,
+                'nms_kernel_size': args.nms_kernel_size,
+                'match_min_cossim': args.match_min_cossim,
+                'match_ratio_thresh': args.match_ratio_thresh,
+                'pose_epipolar_error': args.pose_epipolar_error,
+                'preset': args.preset,
+            },
+        }
+        summaries.append(summary)
+
+        print(f'\n==={cur_time}==={args.name}===')
+        print(f'descriptor_source: {descriptor_source}, keypoint_source: {keypoint_source}')
+        for s_k, s_v in summary['metrics'].items():
+            print(f'{s_k}: {s_v}')
+
+    if args.save_json:
+        with open(args.save_json, 'w', encoding='utf-8') as f:
+            json.dump(summaries, f, indent=2)

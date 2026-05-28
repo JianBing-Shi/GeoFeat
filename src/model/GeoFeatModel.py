@@ -16,7 +16,7 @@ import cv2
 
 import sys
 from typing import List, Tuple, Optional
-from src.config.config import get_cfg_defaults
+from src.config.config import get_cfg_defaults, get_model_config
 
 
 """
@@ -146,7 +146,9 @@ def _fuse_conv_and_bn(conv, bn):
 		bn_b = bn.bias
 		bn_rm = bn.running_mean
 		bn_rv = bn.running_var
-		eps = bn.epss
+		if bn_w is None or bn_b is None or bn_rm is None or bn_rv is None:
+			raise RuntimeError("BatchNorm2d must have affine params and running stats before fusion.")
+		eps = bn.eps
 
 		std = torch.sqrt(bn_rv + eps)
 		w_fold = w * (bn_w / std).reshape(-1, 1, 1, 1)
@@ -207,10 +209,13 @@ class RepVGGBlock(nn.Module):
 
 		if self.rbr_identity is not None:
 			bn = self.rbr_identity
-			std = torch.sqrt(bn.running_var + bn.eps)
+			running_var = bn.running_var
 			gamma = bn.weight
 			beta = bn.bias
 			running_mean = bn.running_mean
+			if running_var is None or gamma is None or beta is None or running_mean is None:
+				raise RuntimeError("Identity BatchNorm2d must have affine params and running stats before fusion.")
+			std = torch.sqrt(running_var + bn.eps)
 			# identity kernel and bias
 			id_kernel = torch.zeros_like(kernel3x3)
 			for i in range(self.out_channels):
@@ -228,9 +233,14 @@ class RepVGGBlock(nn.Module):
 		if self.deploy:
 			return
 		kernel, bias = self.get_equivalent_kernel_bias()
+		if bias is None:
+			raise RuntimeError("RepVGG fused bias must not be None during deploy conversion.")
 		self.rbr_reparam = nn.Conv2d(self.in_channels, self.out_channels, 3, self.stride, padding=1, bias=True)
-		self.rbr_reparam.weight.data = kernel
-		self.rbr_reparam.bias.data = bias
+		if self.rbr_reparam.bias is None:
+			raise RuntimeError("RepVGG deploy conv must have a bias parameter.")
+		with torch.no_grad():
+			self.rbr_reparam.weight.copy_(kernel)
+			self.rbr_reparam.bias.copy_(bias)
 
 		# delete unneeded branches
 		delattr(self, 'rbr_dense')
@@ -570,39 +580,9 @@ class AttentionalNN(nn.Module):
 			desc = layer(desc)
 		return desc
 
-# --------- LocalRefiner ---------
-# 通用特征增强模块，使用局部细化模块
-class LocalRefiner(nn.Module):
-	"""
-	Local Refinement Module using Depthwise Separable Convolution.
-	Injects local inductive bias after global attention.
-	"""
-	def __init__(self, dim, k=3):
-		super().__init__()
-		self.dw = nn.Conv2d(dim, dim, kernel_size=k, stride=1, padding=k//2, groups=dim)
-		self.norm = nn.LayerNorm(dim)
-		self.pw = nn.Conv2d(dim, dim, kernel_size=1)
-		self.act = nn.GELU()
-
-	def forward(self, x):
-		# x: (B, C, H, W) or (B, N, C) if we handle reshaping
-		input_x = x
-		x = self.dw(x)
-		x = x.permute(0, 2, 3, 1) # (B, H, W, C)
-		x = self.norm(x)
-		x = x.permute(0, 3, 1, 2) # (B, C, H, W)
-		x = self.act(x)
-		x = self.pw(x)
-		return input_x + x
-
 
 class GCDR(nn.Module):
-	"""Geo-Conditional Descriptor Refinement with reliability-aware fusion.
-
-	Geometry first predicts a per-location reliability score, and that score
-	controls how strongly the FiLM modulation is allowed to change descriptors.
-	This turns GCDR from unconditional geometry injection into trust-aware fusion.
-	"""
+	"""Fixed mainline GCDR: reliability-aware FiLM with residual gating."""
 
 	def __init__(
 		self,
@@ -611,10 +591,14 @@ class GCDR(nn.Module):
 		geo_compress: int = 8,
 		reliability_hidden: int = 16,
 		gate_floor: float = 0.10,
+		residual_gain: float = 1.0,
+		residual_gate_floor: float = 0.10,
 	):
 		super().__init__()
 		self.dim = dim
 		self.gate_floor = float(max(0.0, min(gate_floor, 1.0)))
+		self.residual_gain = float(max(0.0, residual_gain))
+		self.residual_gate_floor = float(max(0.0, min(residual_gate_floor, 1.0)))
 
 		self.geo_proj = nn.Sequential(
 			nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
@@ -658,153 +642,12 @@ class GCDR(nn.Module):
 		scale = scale.permute(0, 2, 3, 1)
 		shift = shift.permute(0, 2, 3, 1)
 
-		out = desc * (1.0 + scale) + shift
+		residual = desc * scale + shift
+		residual_gate = self.residual_gate_floor + (1.0 - self.residual_gate_floor) * reliability_map
+		residual_gate = residual_gate.permute(0, 2, 3, 1)
+		out = desc + (self.residual_gain * residual_gate) * residual
 		out = self.norm(out)
 		return out, reliability_map
-
-
-class GCLA(nn.Module):
-	"""Geometric-Coupled Local Aggregation v2 (GCLA-v2).
-	
-	Enhanced version with:
-	- Multi-scale convolution towers (3x3, 5x5, 7x7)
-	- Learnable scale weighting
-	- Learnable cross-modal coupling gates (replacing fixed addition)
-	
-	Fuses 2D spatial features and 3D geometric features through
-	multi-scale parallel aggregation with adaptive inter-modal weighting.
-	"""
-	def __init__(
-		self,
-		dim,
-		geo_dim,
-		geo_compress=16,
-		k=3,
-		k_scales=None,
-		use_residual_scale=False,
-		residual_init=0.1,
-		symmetric_coupling=False,
-		use_stack_sum=False,
-		gate_hidden=32,
-	):
-		super().__init__()
-		if k_scales is None:
-			k_scales = [3, 5, 7]  # Multi-scale receptive fields
-		
-		self.dim = dim
-		self.geo_compress = geo_compress
-		self.k_scales = k_scales
-		self.symmetric_coupling = bool(symmetric_coupling)
-		self.use_stack_sum = bool(use_stack_sum)
-		gate_hidden = max(1, int(gate_hidden))
-		
-		# Compress geometric features for efficient local aggregation
-		self.geo_proj = nn.Sequential(
-			nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
-			nn.BatchNorm2d(geo_compress),
-			nn.GELU(),
-		)
-		
-		# Multi-scale depthwise convolutions for spatial features
-		self.dw_spatial_scales = nn.ModuleList([
-			nn.Conv2d(dim, dim, ks, padding=ks // 2, groups=dim)
-			for ks in k_scales
-		])
-		
-		# Multi-scale depthwise convolutions for geometric features
-		self.dw_geo_scales = nn.ModuleList([
-			nn.Conv2d(geo_compress, geo_compress, ks, padding=ks // 2, groups=geo_compress)
-			for ks in k_scales
-		])
-		
-		# Learnable scale weights for spatial and geometric branches
-		self.scale_weight_spatial = nn.Parameter(
-			torch.ones(len(k_scales)) / len(k_scales)
-		)
-		self.scale_weight_geo = nn.Parameter(
-			torch.ones(len(k_scales)) / len(k_scales)
-		)
-		
-		# Cross-modal coupling (3D to 2D and 2D to 3D)
-		self.geo_to_spatial = nn.Conv2d(geo_compress, dim, 1)
-		self.spatial_to_geo = nn.Conv2d(dim, geo_compress, 1)
-		
-		# Learnable coupling gates: how much to trust each modality's contribution
-		self.coupling_gate = nn.Sequential(
-			nn.Conv2d(dim + geo_compress, gate_hidden, 1),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(gate_hidden, 2, 1),  # Output: [gate_spatial, gate_geo]
-			nn.Sigmoid(),
-		)
-		
-		# Output projection
-		self.pw = nn.Conv2d(dim + geo_compress, dim, 1)
-		self.norm = nn.LayerNorm(dim)
-		self.act = nn.GELU()
-		self.residual_scale = None
-		if use_residual_scale:
-			self.residual_scale = nn.Parameter(torch.tensor(float(residual_init)))
-
-	def forward(self, x, geo_map):
-		residual = x
-
-		# Compress 3D geometric features
-		geo_feat = self.geo_proj(geo_map)
-
-		# Multi-scale spatial aggregation: weighted combination of different receptive fields
-		spatial_weights = F.softmax(self.scale_weight_spatial, dim=0)
-		if self.use_stack_sum:
-			spatial_terms = [
-				w * conv(x)
-				for w, conv in zip(spatial_weights, self.dw_spatial_scales)
-			]
-			f_spatial = torch.stack(spatial_terms, dim=0).sum(dim=0)
-		else:
-			f_spatial = sum(
-				w * conv(x)
-				for w, conv in zip(spatial_weights, self.dw_spatial_scales)
-			)
-
-		# Multi-scale geometric aggregation: weighted combination of different receptive fields
-		geo_weights = F.softmax(self.scale_weight_geo, dim=0)
-		if self.use_stack_sum:
-			geo_terms = [
-				w * conv(geo_feat)
-				for w, conv in zip(geo_weights, self.dw_geo_scales)
-			]
-			f_geo = torch.stack(geo_terms, dim=0).sum(dim=0)
-		else:
-			f_geo = sum(
-				w * conv(geo_feat)
-				for w, conv in zip(geo_weights, self.dw_geo_scales)
-			)
-
-		# Learnable cross-modal coupling (replaces fixed addition)
-		coupled = torch.cat([f_spatial, f_geo], dim=1)
-		gates = self.coupling_gate(coupled)  # [B, 2, H, W]
-		gate_spatial, gate_geo = gates[:, 0:1], gates[:, 1:2]
-
-		# Adaptive coupling: apply learned gates to cross-modal contributions
-		if self.symmetric_coupling:
-			spatial_update = gate_geo * self.geo_to_spatial(f_geo)
-			geo_update = gate_spatial * self.spatial_to_geo(f_spatial)
-			f_spatial = f_spatial + spatial_update
-			f_geo = f_geo + geo_update
-		else:
-			f_spatial = f_spatial + gate_geo * self.geo_to_spatial(f_geo)
-			f_geo = f_geo + gate_spatial * self.spatial_to_geo(f_spatial)
-
-		# Merge and project
-		out = torch.cat([f_spatial, f_geo], dim=1)
-		out = self.pw(out)
-		out = out.permute(0, 2, 3, 1)
-		out = self.norm(out)
-		out = out.permute(0, 3, 1, 2)
-		out = self.act(out)
-
-		if self.residual_scale is not None:
-			return residual + self.residual_scale * out
-		return residual + out
 
 class FeatureBooster(nn.Module):
 	def __init__(self, model_config, dropout=False, p=0.1):
@@ -878,28 +721,15 @@ class FeatureBooster(nn.Module):
 		)
 
 		# [Refiner Integration] Select Refiner based on config
-		# Modes: 'None', 'Local', 'GCLA', 'GCDR'
+		# Modes: 'None', 'GCDR'
 		self.refiner_type = model_config['refiner_type']
 		self.pre_attn_refiner = None  # Pre-attention refiner slot (GCDR)
 		total_geo_channels = sum(
 			dim for name, dim in self.geo_raw_dims.items()
 			if model_config['geometric_features'][name]
 		)
-		if self.refiner_type == 'Local':
-			self.refiner = LocalRefiner(dim=self.model_config['descriptor_dim'])
-		elif self.refiner_type == 'GCLA':
-			gcla_cfg = dict(self.model_config.get('gcla_config', {}))
-			self.refiner = GCLA(
-				dim=self.model_config['descriptor_dim'],
-				geo_dim=total_geo_channels * geo_token_mult,
-				geo_compress=int(gcla_cfg.get('geo_compress', 16)),
-				k_scales=list(gcla_cfg.get('k_scales', [3, 5, 7])),
-				use_residual_scale=bool(gcla_cfg.get('use_residual_scale', False)),
-				residual_init=float(gcla_cfg.get('residual_init', 0.1)),
-				symmetric_coupling=bool(gcla_cfg.get('symmetric_coupling', False)),
-				use_stack_sum=bool(gcla_cfg.get('use_stack_sum', False)),
-				gate_hidden=int(gcla_cfg.get('gate_hidden', 32)),
-			)
+		if self.refiner_type == 'None':
+			pass
 		elif self.refiner_type == 'GCDR':
 			# GCDR inserts BEFORE AttentionalNN: geometry conditions descriptors
 			# early so attention builds on geometry-aware representations.
@@ -910,12 +740,28 @@ class FeatureBooster(nn.Module):
 				geo_compress=int(gcdr_cfg.get('geo_compress', 8)),
 				reliability_hidden=int(gcdr_cfg.get('reliability_hidden', 16)),
 				gate_floor=float(gcdr_cfg.get('gate_floor', 0.10)),
+				residual_gain=float(gcdr_cfg.get('residual_gain', 1.0)),
+				residual_gate_floor=float(gcdr_cfg.get('residual_gate_floor', 0.10)),
 			)
-			self.refiner = None
 		else:
 			raise ValueError(
 				f"Unsupported REFINER_TYPE '{self.refiner_type}'. "
-				"Expected one of: 'None', 'Local', 'GCLA', 'GCDR'."
+				"Expected one of: 'None', 'GCDR'. "
+				"Check MODEL.REFINER_TYPE in src/config/config.py or your --config_file override."
+			)
+
+	def validate_refiner_configuration(self):
+		refiner_type = str(self.model_config.get('refiner_type', 'None'))
+		if refiner_type == 'GCDR':
+			if self.pre_attn_refiner is None:
+				raise RuntimeError(
+					"Config requests REFINER_TYPE='GCDR', but pre_attn_refiner is None. "
+					"Check MODEL.REFINER_TYPE / MODEL.GCDR in src/config/config.py or your merged YAML override, "
+					"then verify GCDR wiring in GeoFeatModel.py."
+				)
+		elif refiner_type != 'None':
+			raise RuntimeError(
+				f"Config requests unsupported REFINER_TYPE='{refiner_type}'. Only 'None' and 'GCDR' remain wired in GeoFeatModel.py."
 			)
 
 		# Final activation
@@ -981,14 +827,9 @@ class FeatureBooster(nn.Module):
 		desc_flat = self.attn_proj(desc_flat, shape=(H_curr, W_curr))
 		desc = desc_flat.reshape(B_curr, H_curr, W_curr, C_curr)
 
-		# 5. Local Refiner / GCLA
-		# Convert back to NCHW for Conv2d based Refiner and final output
+		# 5. Final projection path
+		# Convert back to NCHW for final output
 		desc_map = desc.permute(0, 3, 1, 2)
-		if self.refiner is not None:
-			if self.refiner_type == 'Local':
-				desc_map = self.refiner(desc_map)
-			elif self.refiner_type == 'GCLA' and geo_v is not None:
-				desc_map = self.refiner(desc_map, geo_v)
 
 		# Final projection / activation
 		if self.last_activation is not None:
@@ -1046,6 +887,7 @@ class GeoFeatModel(nn.Module):
 		self.repeatability_proj = nn.Conv2d(1, self.keypoint_dim, kernel_size=1, bias=True)
 
 		self.attn_fusion = FeatureBooster(model_config)
+		self.attn_fusion.validate_refiner_configuration()
 	
 	def fuse_multi_features(self,x3,x4,x5):
 		# upsample x5 feature
@@ -1155,63 +997,7 @@ if __name__ == "__main__":
 	# Setup configuration from the central config file
 	cfg = get_cfg_defaults()
 	
-	model_config = {
-		"backbone": cfg.MODEL.BACKBONE,									# 骨干网络
-		# 关键点编码器
-		'keypoint_encoder': list(cfg.MODEL.KEYPOINT_ENCODER),			# 关键点编码器
-		'keypoint_dim': int(cfg.MODEL.KEYPOINT_DIM),					# 关键点维度
-		# 描述子编码器
-		'descriptor_encoder': list(cfg.MODEL.DESCRIPTOR_ENCODER),		# 描述子编码器
-		'descriptor_dim': int(cfg.MODEL.DESCRIPTOR_DIM),				# 描述子维度
-		# 几何特征配置
-		'geometric_features': {
-			'depth': bool(cfg.MODEL.GEOMETRIC_FEATURES.DEPTH),
-			'normal': bool(cfg.MODEL.GEOMETRIC_FEATURES.NORMAL),
-			'gradients': bool(cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS),
-			'curvatures': bool(cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES),
-		},
-		# 几何特征编码器
-		# 深度编码器
-		'depth_encoder': list(cfg.MODEL.DEPTH_ENCODER),
-		'depth_dim': int(cfg.MODEL.DEPTH_DIM),
-		# 法向量编码器
-		'normal_encoder': list(cfg.MODEL.NORMAL_ENCODER),
-		'normal_dim': int(cfg.MODEL.NORMAL_DIM),
-		# 梯度编码器
-		'gradient_encoder': list(cfg.MODEL.GRADIENT_ENCODER),
-		'gradient_dim': int(cfg.MODEL.GRADIENT_DIM),
-		# 曲率编码器
-		'curvature_encoder': list(cfg.MODEL.CURVATURE_ENCODER),
-		'curvature_dim': int(cfg.MODEL.CURVATURE_DIM),
-		# 几何预处理模式
-		'geo_preprocess_mode': str(cfg.MODEL.GEO_PREPROCESS_MODE),
-		# 重复性图权重系数
-		'repeatability_alpha': float(cfg.MODEL.REPEATABILITY_ALPHA),
-		# 注意力机制配置
-		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
-		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
-		'gcla_config': {
-			'k_scales': list(cfg.MODEL.GCLA.K_SCALES),
-			'geo_compress': int(cfg.MODEL.GCLA.GEO_COMPRESS),
-			'use_residual_scale': bool(cfg.MODEL.GCLA.USE_RESIDUAL_SCALE),
-			'residual_init': float(cfg.MODEL.GCLA.RESIDUAL_INIT),
-			'symmetric_coupling': bool(cfg.MODEL.GCLA.SYMMETRIC_COUPLING),
-			'use_stack_sum': bool(cfg.MODEL.GCLA.USE_STACK_SUM),
-			'gate_hidden': int(cfg.MODEL.GCLA.GATE_HIDDEN),
-		},
-		'gcdr_config': {
-			'geo_compress': int(cfg.MODEL.GCDR.GEO_COMPRESS),
-			'reliability_hidden': int(cfg.MODEL.GCDR.RELIABILITY_HIDDEN),
-			'gate_floor': float(cfg.MODEL.GCDR.GATE_FLOOR),
-			'reliability_loss_weight': float(cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT),
-			'reliability_consistency_weight': float(cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT),
-			'reliability_target_scale': float(cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE),
-		},
-		# 细化匹配器配置
-		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
-		# 模型输出维度
-		'output_dim': int(cfg.MODEL.OUTPUT_DIM),
-	}
+	model_config = get_model_config(cfg)
 
 	# Image loading and processing
 	img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)

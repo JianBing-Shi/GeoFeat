@@ -6,6 +6,16 @@
 
 > **GeoFeat** 是一个创新的局部特征描述子学习框架，通过融合多阶几何信息（深度、法向量、曲率）并结合 AFTAttention 机制，显著提升了图像匹配在复杂几何场景下的鲁棒性。
 
+默认的 DATASET 与 MODEL 配置集中在 [src/config/config.py](src/config/config.py)。日常训练可以直接编辑这个主配置文件；[src/config/experiments](src/config/experiments) 下的 YAML 仅作为在默认配置之上的快捷覆盖层，通过 `--config_file` 叠加使用。
+
+## 当前主线
+
+- 训练入口只保留 [train.py](train.py)。
+- 推理可视化入口保留 [visualize_inference.py](visualize_inference.py)，现在通过 `--run-dir` 或 `--config-path` + `--weights-path` 显式加载当前权重快照。
+- 评测入口保留 [evaluation/HPatch_evaluation.py](evaluation/HPatch_evaluation.py)、[evaluation/MegaDepth1500_evaluation.py](evaluation/MegaDepth1500_evaluation.py) 和 [evaluation/ScanNet1500_evaluation.py](evaluation/ScanNet1500_evaluation.py)，它们会从 checkpoint 所在目录自动读取 `config_snapshot.json`。
+- 历史训练脚本和根目录实验脚本已迁入 [legacy/archive/train/README.md](legacy/archive/train/README.md) 与 [legacy/archive/tools/README.md](legacy/archive/tools/README.md)。
+- 当前主线细化模块固定为 GCDR；Local/GCLA 仅作为历史实现保留在归档语义中，不再属于默认训练路径。
+
 ## 📅 项目动态 (Project Status)
 
 
@@ -26,11 +36,109 @@ GeoFeat 首次系统性地引入了 0-2 阶几何信息，弥补了传统纹理�
 - **AFTAttention (Attention-Free Transformer)**: 
   采用高效的 AFT 机制替代传统 Self-Attention，在保持全局感受野的同时大幅降低计算复杂度，实现几何特征的全局交互。
 
-- **GeometricLocalRefiner**:GCLA 几何耦合局部聚合（Geometric-Coupled Local Aggregation）
-  专为几何特征设计的局部细化模块。利用深度可分离卷积 (Depthwise Separable Conv) 注入局部归纳偏置，防止特征在几何不连续处（如物体边缘）发生过度平滑。
-  发现门控有害：几何门控在匹配时间不对称，损害鲁棒性
-  提出加法耦合：用固定的映射函数替代门控，保证一致性
-  双向增强：2D <-> 3D 互相提供上下文，信息互补，提升几何感知能力
+- **GCDR (Geo-Conditional Descriptor Refinement)**:
+  当前主线在全局注意力之前利用几何特征对描述子做条件调制，让后续 AFTAttention 直接建立在 geometry-aware descriptor 上。对应实现位于 [src/model/GeoFeatModel.py](src/model/GeoFeatModel.py) 的 `FeatureBooster.pre_attn_refiner`。
+  当前固定主线为：几何压缩 -> 可靠性预测 -> FiLM 调制 -> 残差注入 -> LayerNorm，不再暴露旧的 Local/GCLA 分支选择。
+
+#### 2.1 当前 GeoFeat 实际框架图 (与代码一致)
+
+下面这张图是按当前实现整理的真实数据流（尤其修正了 GCDR 与 Linear Attention 的先后关系）：
+
+```mermaid
+flowchart LR
+  I[Input Image] --> B[Backbone: Standard or RepVGG]
+
+  B --> KF[Feature Fusion x3 x4 x5]
+  KF --> KH[Keypoint Head]
+  KF --> DH[Descriptor Head]
+  KF --> GH[Geo Head]
+
+  GH --> GP[Geo Preprocess]
+  DH --> DE[Descriptor Encoder]
+  GP --> GE[Geo Branch Encoders]
+  DE --> ADD1((Add))
+  GE --> ADD1
+
+  KH --> FB[FeatureBooster]
+  ADD1 --> FB
+
+  FB --> GCDR[GCDR Pre-Attention Refinement]
+  GCDR --> ATTN[AttentionalNN with AFT Blocks]
+  ATTN --> NORM[L2 Normalize]
+  NORM --> DESC[Descriptor 64D]
+
+  NORM --> REP[Repeatability Head]
+  REP --> PROJ[1x1 Projection to Keypoint Dim]
+  KH --> MIX
+  PROJ --> MIX
+  MIX[Keypoint Logits Fusion alpha] --> RK[Refined Keypoint Logits]
+```
+
+说明：
+- 当前主干实现中，Geo Head 直接来自 Backbone 融合特征，不依赖独立的 DepthAnything 前向分支。
+- 当前默认 `REFINER_TYPE=GCDR`，并且 GCDR 在注意力之前执行（pre-attention）。
+- 输出端同时产生描述子与重复性图，重复性图会按 `REPEATABILITY_ALPHA` 融合回关键点 logits。
+
+#### 2.2 GCDR 模块展开图 (重点)
+
+```mermaid
+flowchart TD
+  IN1[Input Descriptor NHWC] --> DM[To NCHW]
+  IN2[Geo Map] --> GP2[Geo Projection 1x1 Conv plus BN plus GELU]
+
+  GP2 --> GFEAT[Compressed Geo Feature]
+  DM --> CAT1
+  GFEAT --> CAT1
+  CAT1[Concat Desc and Geo] --> REL[Reliability Head]
+  REL --> SIG1[Sigmoid]
+  SIG1 --> GATE[Gate with Floor]
+
+  GFEAT --> FILM[FiLM Generator 1x1 Conv]
+  FILM --> SPLIT[Split Scale and Shift]
+  SPLIT --> RES0[Residual Build]
+  GATE --> RES1[Residual Gate]
+  RES0 --> OUTADD[Desc plus residual_gain times gate times residual]
+  RES1 --> OUTADD
+  OUTADD --> LN[LayerNorm]
+  LN --> OUT1[Refined Descriptor NHWC]
+  SIG1 --> OUT2[Geo Reliability Map]
+```
+
+GCDR 的核心计算可写为：
+
+$$
+r = \sigma(\text{RelHead}([d, g]))
+$$
+
+$$
+\hat{g} = \text{GeoProj}(g),\quad [s, b] = \text{FiLM}(\hat{g})
+$$
+
+$$
+\gamma = g_{\min} + (1-g_{\min})\cdot r
+$$
+
+$$
+\Delta d = (d \odot \tanh(s) + b) \odot \gamma
+$$
+
+$$
+d' = \text{LayerNorm}(d + \lambda\cdot\Gamma\cdot\Delta d)
+$$
+
+其中：
+- $r$ 是像素级几何可靠性。
+- $\gamma$ 是由可靠性下限约束后的门控权重。
+- $\lambda$ 对应 `residual_gain`。
+
+#### 2.3 配置到模块的对应关系
+
+在 [src/config/config.py](src/config/config.py) 中：
+- `MODEL.REFINER_TYPE` 当前主线固定使用 `GCDR`。
+- `MODEL.GCDR.GEO_COMPRESS` 控制几何压缩通道。
+- `MODEL.GCDR.RELIABILITY_HIDDEN` 控制可靠性预测头的隐藏通道。
+- `MODEL.GCDR.GATE_FLOOR`、`RESIDUAL_GAIN`、`RESIDUAL_GATE_FLOOR` 控制残差注入强度与下限。
+- `LOSS.RELIABILITY_LOSS_WEIGHT`、`RELIABILITY_CONSISTENCY_WEIGHT`、`RELIABILITY_TARGET_SCALE` 控制可靠性监督。
 
 ### 3. 高分辨率几何解耦 (High-Res Geometry Unfolding)
 

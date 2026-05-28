@@ -276,10 +276,10 @@ class GeoFeatTrainer(pl.LightningModule):
 		# Passing 'cpu' initially, will move to device automatically? 
 		# GeoFeatLoss stores device for tensor creation. capture it dynamically or pass property
 		# We'll handle device in forward logic or create loss in setup
-		gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
+		loss_cfg = dict(self.model_config.get('loss_config', {}))
 		reliability_loss_weight = 0.0
 		if self.model_config.get('refiner_type') == 'GCDR':
-			reliability_loss_weight = float(gcdr_cfg.get('reliability_loss_weight', 1.0))
+			reliability_loss_weight = float(loss_cfg.get('reliability_loss_weight', 1.0))
 		self.loss_fn_params = {
 			'lam_descs': 1,
 			'lam_fb_descs': 2,
@@ -288,8 +288,8 @@ class GeoFeatTrainer(pl.LightningModule):
 			'lam_reliability': reliability_loss_weight,
 			'lam_gradients': 10,
 			'lam_curvature': 10,
-			'reliability_consistency_weight': float(gcdr_cfg.get('reliability_consistency_weight', 0.25)),
-			'reliability_target_scale': float(gcdr_cfg.get('reliability_target_scale', 6.0)),
+			'reliability_consistency_weight': float(loss_cfg.get('reliability_consistency_weight', 0.25)),
+			'reliability_target_scale': float(loss_cfg.get('reliability_target_scale', 6.0)),
 			'geo_config': geo_config
 		}
 		# Note: GeoFeatLoss takes 'device' in init. We delay instantiation or update it.
@@ -550,22 +550,17 @@ if __name__ == '__main__':
 		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
 		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
 		'geo_preprocess_mode': str(cfg.MODEL.GEO_PREPROCESS_MODE),
-		'gcla_config': {
-			'k_scales': list(cfg.MODEL.GCLA.K_SCALES),
-			'geo_compress': int(cfg.MODEL.GCLA.GEO_COMPRESS),
-			'use_residual_scale': bool(cfg.MODEL.GCLA.USE_RESIDUAL_SCALE),
-			'residual_init': float(cfg.MODEL.GCLA.RESIDUAL_INIT),
-			'symmetric_coupling': bool(cfg.MODEL.GCLA.SYMMETRIC_COUPLING),
-			'use_stack_sum': bool(cfg.MODEL.GCLA.USE_STACK_SUM),
-			'gate_hidden': int(cfg.MODEL.GCLA.GATE_HIDDEN),
-		},
 		'gcdr_config': {
 			'geo_compress': int(cfg.MODEL.GCDR.GEO_COMPRESS),
 			'reliability_hidden': int(cfg.MODEL.GCDR.RELIABILITY_HIDDEN),
 			'gate_floor': float(cfg.MODEL.GCDR.GATE_FLOOR),
-			'reliability_loss_weight': float(cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT),
-			'reliability_consistency_weight': float(cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT),
-			'reliability_target_scale': float(cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE),
+			'residual_gain': float(cfg.MODEL.GCDR.RESIDUAL_GAIN),
+			'residual_gate_floor': float(cfg.MODEL.GCDR.RESIDUAL_GATE_FLOOR),
+		},
+		'loss_config': {
+			'reliability_loss_weight': float(cfg.LOSS.RELIABILITY_LOSS_WEIGHT),
+			'reliability_consistency_weight': float(cfg.LOSS.RELIABILITY_CONSISTENCY_WEIGHT),
+			'reliability_target_scale': float(cfg.LOSS.RELIABILITY_TARGET_SCALE),
 		},
 		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
 		'output_dim': int(cfg.MODEL.OUTPUT_DIM),

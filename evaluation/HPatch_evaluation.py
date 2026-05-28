@@ -1,6 +1,5 @@
 import argparse
 import datetime
-import json
 import os
 import sys
 
@@ -11,7 +10,7 @@ from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from evaluation.eval_utils import homo_trans
-from src.utils.geofeat_wrapper import GeoFeat
+from src.utils.geofeat_wrapper import GeoFeat, load_model_config_for_weights
 
 
 parser = argparse.ArgumentParser(description='HPatch dataset evaluation script for GeoFeat')
@@ -30,15 +29,6 @@ os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
 n_i = 52
 n_v = 56
-
-
-def normalize_model_config(model_config: dict) -> dict:
-    cfg = dict(model_config)
-    if 'repeatability_alpha' not in cfg:
-        cfg['repeatability_alpha'] = 0.0
-        print("Warning: model_config missing 'repeatability_alpha'; fallback to 0.0.")
-    return cfg
-
 
 def benchmark_features(match_fn, dataset_root: str):
     lim = [1, 9]
@@ -141,13 +131,7 @@ if __name__ == '__main__':
     if not os.path.isdir(dataset_root):
         raise FileNotFoundError(f'HPatches root directory not found: {dataset_root}')
 
-    snapshot_path = os.path.join(os.path.dirname(weights), 'config_snapshot.json')
-    if not os.path.exists(snapshot_path):
-        raise FileNotFoundError(f'No config_snapshot.json found at {snapshot_path}')
-
-    with open(snapshot_path, 'r', encoding='utf-8') as f:
-        snap = json.load(f)
-    model_config = normalize_model_config(snap.get('model_config', snap))
+    model_config = load_model_config_for_weights(weights)
 
     geofeat = GeoFeat(model_config=model_config, weight_path=weights)
 

@@ -1,4 +1,5 @@
 import math
+import json
 import os
 import sys
 from typing import Dict, Optional, Tuple, cast
@@ -68,6 +69,45 @@ def validate_model_config(model_config: Optional[dict]) -> dict:
 			raise ValueError(f"model_config['geometric_features'] missing key: {key}")
 
 	return model_config
+
+
+def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
+	"""Patch older config snapshots so evaluation/inference can load archived checkpoints."""
+	if model_config is None:
+		raise ValueError("model_config is required, got None")
+	if not isinstance(model_config, dict):
+		raise TypeError(f"model_config must be a dict, got {type(model_config)}")
+
+	cfg = dict(model_config)
+	fallbacks = {
+		"repeatability_alpha": 0.0,
+		"geo_preprocess_mode": "no_unfold_lite",
+	}
+	for key, value in fallbacks.items():
+		if key not in cfg:
+			cfg[key] = value
+			print(f"Warning: model_config missing '{key}'; fallback to {value!r}.")
+	return cfg
+
+
+def load_model_config_snapshot(snapshot_path: str) -> dict:
+	"""Load and normalize a config snapshot produced by training."""
+	if not os.path.isfile(snapshot_path):
+		raise FileNotFoundError(f"Config snapshot not found: {snapshot_path}")
+
+	with open(snapshot_path, "r", encoding="utf-8") as handle:
+		payload = json.load(handle)
+	if isinstance(payload, dict) and "model_config" in payload:
+		payload = payload["model_config"]
+	return normalize_legacy_model_config(payload)
+
+
+def load_model_config_for_weights(weight_path: str) -> dict:
+	"""Load config_snapshot.json from the same run directory as a checkpoint."""
+	if not weight_path:
+		raise ValueError("weight_path is required to locate config_snapshot.json")
+	snapshot_path = os.path.join(os.path.dirname(os.path.abspath(weight_path)), "config_snapshot.json")
+	return load_model_config_snapshot(snapshot_path)
 
 
 def load_model(model: nn.Module, weight_path: Optional[str]) -> nn.Module:

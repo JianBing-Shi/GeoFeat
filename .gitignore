@@ -10,18 +10,9 @@ data/
 logdir/
 
 # weights file
-weights/*
-weights_win/*
-weights_0227/*
-weights_0308/*
-weights_0314/*
-weights_0322/*
-weights_0326/*
-weights_0401/*
-weights_0410/*
-weights_0424/*
 weights_0430/*
 weights_0501/*
+weights_0520/*
 
 # onnx models
 *.onnx

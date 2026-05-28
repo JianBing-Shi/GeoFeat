@@ -1,0 +1,24 @@
+{
+  "metrics": {
+    "auc@5": 8.149701075137003,
+    "auc@10": 19.858360583566505,
+    "auc@20": 35.35473231837811,
+    "prec@5e-4": 43.171662317544325
+  },
+  "num_pairs": 1500,
+  "num_pose_failures": 0,
+  "timestamp": "2026-05-28 23:38:54",
+  "name": "LiftFeat",
+  "model_type": "LiftFeat",
+  "protocol": "raw",
+  "weights": "D:\\Projects\\GeoFeat\\LiftFeat\\weights\\LiftFeat.pth",
+  "eval_args": {
+    "top_k": 4096,
+    "detect_threshold": 0.05,
+    "nms_kernel_size": 7,
+    "match_min_cossim": 0.0,
+    "match_ratio_thresh": 0.0,
+    "max_pairs": 0,
+    "ransac_pixel_thr": 4.0
+  }
+}

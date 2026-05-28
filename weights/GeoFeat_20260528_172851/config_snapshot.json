@@ -1,0 +1,98 @@
+{
+  "timestamp": "20260528_172851",
+  "model_name": "GeoFeat",
+  "train_params": {
+    "n_steps": 160000,
+    "save_ckpt_every": 1000,
+    "lr": 0.0003,
+    "gamma_steplr": 0.5,
+    "training_res": [
+      800,
+      600
+    ],
+    "device": "cuda"
+  },
+  "data_config": {
+    "use_megadepth": true,
+    "use_coco": true,
+    "megadepth_root_path": "./datasets/MegaDepth",
+    "megadepth_batch_size": 2,
+    "coco_root_path": "./datasets/coco_20k",
+    "coco_batch_size": 2
+  },
+  "model_config": {
+    "backbone": "Standard",
+    "keypoint_encoder": [
+      128,
+      64,
+      64
+    ],
+    "keypoint_dim": 65,
+    "descriptor_encoder": [
+      64,
+      64
+    ],
+    "descriptor_dim": 64,
+    "geometric_features": {
+      "depth": true,
+      "normal": true,
+      "gradients": true,
+      "curvatures": true
+    },
+    "depth_encoder": [
+      128,
+      64,
+      64
+    ],
+    "depth_dim": 64,
+    "normal_encoder": [
+      128,
+      64,
+      64
+    ],
+    "normal_dim": 192,
+    "gradient_encoder": [
+      64,
+      32,
+      32
+    ],
+    "gradient_dim": 128,
+    "curvature_encoder": [
+      64,
+      32,
+      32
+    ],
+    "curvature_dim": 64,
+    "geo_preprocess_mode": "no_unfold_lite",
+    "repeatability_alpha": 0.35,
+    "attention_layers": 3,
+    "refiner_type": "GCDR",
+    "gcdr_config": {
+      "geo_compress": 16,
+      "reliability_hidden": 16,
+      "gate_floor": 0.1,
+      "residual_gain": 1.0,
+      "residual_gate_floor": 0.1
+    },
+    "loss_config": {
+      "reliability_loss_weight": 0.0,
+      "reliability_consistency_weight": 0.25,
+      "reliability_target_scale": 6.0
+    },
+    "last_activation": "None",
+    "output_dim": 64
+  },
+  "train_kpt_config": {
+    "use_dual_kpt_loss": false,
+    "kpt_single_source": "raw",
+    "kpt_raw_weight_start": 0.8,
+    "kpt_raw_weight_end": 0.2,
+    "kpt_refined_weight_start": 0.2,
+    "kpt_refined_weight_end": 0.8,
+    "kpt_ramp_steps": 128000,
+    "kpt_step_clock": 1000
+  },
+  "checkpoint_policy": {
+    "best_metric": "acc_fb_coarse"
+  }
+}

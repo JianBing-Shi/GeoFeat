@@ -1,0 +1,49 @@
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'Times New Roman','fontSize':'18px','primaryColor':'#ffffff','primaryTextColor':'#111111','primaryBorderColor':'#222222','lineColor':'#222222','background':'#ffffff'}, 'flowchart': {'curve': 'linear','nodeSpacing': 40,'rankSpacing': 45}}}%%
+flowchart LR
+    I[Input Image] --> B[Backbone: Standard or RepVGG]
+    B --> F[FPN-like Multi-Scale Fusion x3 x4 x5]
+
+    F --> KH[Keypoint Head]
+    F --> DH[Descriptor Head]
+    F --> GH[Geo Head]
+
+    GH --> GP{Geo Preprocess Mode}
+    GP -->|unfold| GU[Unfold 8x8 to channel tokens]
+    GP -->|no_unfold_lite| GN[Resize geo map to descriptor resolution]
+
+    DH --> DE[Descriptor Encoder]
+    GU --> GE[Per-branch Geo Encoders + Branch Gates]
+    GN --> GE
+    GE --> ADD1((Add))
+    DE --> ADD1
+
+    ADD1 --> RSEL{REFINER_TYPE}
+
+    RSEL -->|GCDR| GCDR[GCDR Pre-Attention Refinement]
+    GCDR --> AFT[AttentionalNN with AFT Blocks]
+
+    RSEL -->|None| AFT
+    RSEL -->|Local| AFT
+    RSEL -->|GCLA| AFT
+
+    AFT --> POST{REFINER_TYPE}
+    POST -->|Local| LREF[Local Refiner]
+    POST -->|GCLA| GCLA[GCLA Refiner]
+    POST -->|None or GCDR| BYP[Bypass]
+
+    LREF --> NORM[L2 Normalize]
+    GCLA --> NORM
+    BYP --> NORM
+
+    NORM --> DOUT[Descriptor Output 64D]
+
+    NORM --> REP[Repeatability Head]
+    REP --> PROJ[1x1 Projection to keypoint dim]
+    KH --> MIX[Keypoint Logits Fusion with alpha]
+    PROJ --> MIX
+    MIX --> KOUT[Refined Keypoint Logits]
+
+    style GCDR fill:#ffe9c6,stroke:#333,stroke-width:1.5px
+    style AFT fill:#dceeff,stroke:#333,stroke-width:1.2px
+    style GCLA fill:#e8f7e8,stroke:#333,stroke-width:1.2px
+    style LREF fill:#e8f7e8,stroke:#333,stroke-width:1.2px

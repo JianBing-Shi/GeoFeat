@@ -13,7 +13,7 @@ from typing import cast
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.config.config import get_cfg_defaults
+from src.config.config import get_cfg_defaults, get_data_config, get_model_config
 
 def parse_arguments():
 	parser = argparse.ArgumentParser(description="GeoFeat training script.")
@@ -121,11 +121,11 @@ class Trainer():
 		# Extract dataset parameters from config (assumed validated)
 		use_megadepth = bool(self.data_config['use_megadepth'])
 		megadepth_batch_size = int(self.data_config['megadepth_batch_size']) if use_megadepth else 0
-		megadepth_root_path = self.data_config['megadepth_root_path'] if use_megadepth else None
+		megadepth_root_path = cast(str, self.data_config['megadepth_root_path']) if use_megadepth else None
 
 		use_coco = bool(self.data_config['use_coco'])
 		coco_batch_size = int(self.data_config['coco_batch_size']) if use_coco else 0
-		coco_root_path = self.data_config['coco_root_path'] if use_coco else None
+		coco_root_path = cast(str, self.data_config['coco_root_path']) if use_coco else None
 		
 		print(f'MegeDepth: {use_megadepth}-{megadepth_batch_size}')
 		print(f'COCO20k: {use_coco}-{coco_batch_size}')
@@ -142,19 +142,13 @@ class Trainer():
 					"Config requests REFINER_TYPE='GCDR', but model.attn_fusion.pre_attn_refiner is None. "
 					"Please verify that server GeoFeatModel.py includes the GCDR branch."
 				)
-		if refiner_type == 'GCLA':
-			if getattr(self.net.attn_fusion, 'refiner', None) is None:
-				raise RuntimeError(
-					"Config requests REFINER_TYPE='GCLA', but model.attn_fusion.refiner is None. "
-					"Please verify GCLA branch wiring in GeoFeatModel.py."
-				)
 		
 		# Extract geometric config (validated in __main__)
 		geo_config = self.model_config['geometric_features']
-		gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
+		loss_cfg = dict(self.model_config.get('loss_config', {}))
 		reliability_loss_weight = 0.0
 		if refiner_type == 'GCDR':
-			reliability_loss_weight = float(gcdr_cfg.get('reliability_loss_weight', 1.0))
+			reliability_loss_weight = float(loss_cfg.get('reliability_loss_weight', 1.0))
 
 		self.loss_fn = GeoFeatLoss(
 			self.dev, 
@@ -164,10 +158,8 @@ class Trainer():
 			lam_kpts_raw=2,
 			lam_heatmap=1,
 			lam_reliability=reliability_loss_weight,
-			lam_gradients=10,     # [重点] 放大梯度损失，关注边缘细节
-			lam_curvature=10,     # [重点] 放大曲率损失，关注形状细节
-			reliability_consistency_weight=float(gcdr_cfg.get('reliability_consistency_weight', 0.25)),
-			reliability_target_scale=float(gcdr_cfg.get('reliability_target_scale', 6.0)),
+			reliability_consistency_weight=float(loss_cfg.get('reliability_consistency_weight', 0.25)),
+			reliability_target_scale=float(loss_cfg.get('reliability_target_scale', 6.0)),
 			geo_config=geo_config
 		)
 
@@ -188,8 +180,9 @@ class Trainer():
 		self.use_coco = use_coco
 		self.coco_batch_size = coco_batch_size
 		if self.use_coco:  # 启用COCO
+			coco_img_dir = cast(str, coco_root_path)
 			self.augmentor = COCOAugmentor(
-				img_dir=coco_root_path,
+				img_dir=coco_img_dir,
 				device=self.dev,
 				load_dataset=True,
 				batch_size=self.coco_batch_size,
@@ -240,6 +233,7 @@ class Trainer():
 		self.ckpt_save_path = ckpt_save_path
 		self.save_ckpt_every = save_ckpt_every
 		self.kpt_ramp_steps = max(1, int(0.8 * n_steps))
+		self.best_metric_name = 'acc_fb_coarse'
 
 		# 保存本次运行的配置快照，便于追溯训练超参与模型结构
 		config_snapshot = {
@@ -264,6 +258,9 @@ class Trainer():
 				"kpt_refined_weight_end": self.kpt_refined_weight_end,
 				"kpt_ramp_steps": self.kpt_ramp_steps,
 				"kpt_step_clock": self.save_ckpt_every,
+			},
+			"checkpoint_policy": {
+				"best_metric": self.best_metric_name,
 			},
 		}
 		try:
@@ -386,7 +383,7 @@ class Trainer():
 	# 神经网络训练
 	def train(self):
 		self.net.train()
-		best_acc = 0.0
+		best_metric = float('-inf')
 
 		with tqdm.tqdm(total=self.steps) as pbar:
 			for i in range(self.steps):
@@ -560,13 +557,13 @@ class Trainer():
 					torch.save(self.net.state_dict(), ckpt_path)
 				
 				# 保存最佳权重文件
-				if acc_coarse > best_acc:
-					best_acc = acc_coarse
+				if acc_fb_coarse > best_metric:
+					best_metric = acc_fb_coarse
 					best_ckpt_path = os.path.join(self.ckpt_dir, f'{self.model_name}_{global_step}best.pth')
 					torch.save(self.net.state_dict(), best_ckpt_path)
 
 				# 打印训练过程(损失函数) - 使用 tqdm.write 分行输出详细信息，避免单行过长
-				pbar.set_description(f'Loss/total: {loss.item():.4f} Accuracy/acc_coarse: {acc_coarse:.3f}')
+				pbar.set_description(f'Loss/total: {loss.item():.4f} Accuracy/acc_fb_coarse: {acc_fb_coarse:.3f}')
 				pbar.update(1)
 				# 为什么修改打印训练过程 会该改变训练时间？
 				# tqdm 的 update(n) 方法只是进度条的计数器，它会让进度条前进n步。例如：
@@ -612,14 +609,7 @@ if __name__ == '__main__':
 	if args.config_file:
 		cfg.merge_from_file(args.config_file)
 
-	data_config = {
-		'use_megadepth': bool(cfg.DATASET.USE_MEGADEPTH),
-		'use_coco': bool(cfg.DATASET.USE_COCO),
-		'megadepth_root_path': cfg.DATASET.MEGADEPTH_ROOT_PATH,
-		'megadepth_batch_size': int(cfg.DATASET.MEGADEPTH_BATCH_SIZE),
-		'coco_root_path': cfg.DATASET.COCO_ROOT_PATH,
-		'coco_batch_size': int(cfg.DATASET.COCO_BATCH_SIZE),
-	}
+	data_config = get_data_config(cfg)
 	
 	# Abort if all datasets are disabled
 	if not data_config['use_megadepth'] and not data_config['use_coco']:
@@ -634,64 +624,10 @@ if __name__ == '__main__':
 		print("Error: COCO_ROOT_PATH is empty in config.py while use_coco is True. Abort training.")
 		sys.exit(1)
 
+	use_dual_kpt_loss = bool(args.use_dual_kpt_loss or cfg.TRAIN.USE_DUAL_KPT_LOSS)
 
-	model_config = {
-		"backbone": str(cfg.MODEL.BACKBONE),									# 骨干网络
-		# 关键点编码器
-		'keypoint_encoder': list(cfg.MODEL.KEYPOINT_ENCODER),			# 关键点编码器
-		'keypoint_dim': int(cfg.MODEL.KEYPOINT_DIM),					# 关键点维度
-		# 描述子编码器
-		'descriptor_encoder': list(cfg.MODEL.DESCRIPTOR_ENCODER),		# 描述子编码器
-		'descriptor_dim': int(cfg.MODEL.DESCRIPTOR_DIM),				# 描述子维度
-		# 几何特征配置
-		'geometric_features': {
-			'depth': bool(cfg.MODEL.GEOMETRIC_FEATURES.DEPTH),
-			'normal': bool(cfg.MODEL.GEOMETRIC_FEATURES.NORMAL),
-			'gradients': bool(cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS),
-			'curvatures': bool(cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES),
-		},
-		# 几何特征编码器
-		# 深度编码器
-		'depth_encoder': list(cfg.MODEL.DEPTH_ENCODER),
-		'depth_dim': int(cfg.MODEL.DEPTH_DIM),
-		# 法向量编码器
-		'normal_encoder': list(cfg.MODEL.NORMAL_ENCODER),
-		'normal_dim': int(cfg.MODEL.NORMAL_DIM),
-		# 梯度编码器
-		'gradient_encoder': list(cfg.MODEL.GRADIENT_ENCODER),
-		'gradient_dim': int(cfg.MODEL.GRADIENT_DIM),
-		# 曲率编码器
-		'curvature_encoder': list(cfg.MODEL.CURVATURE_ENCODER),
-		'curvature_dim': int(cfg.MODEL.CURVATURE_DIM),
-		# 几何预处理模式
-		'geo_preprocess_mode': str(cfg.MODEL.GEO_PREPROCESS_MODE),
-		# 重复性图融合权重
-		'repeatability_alpha': float(cfg.MODEL.REPEATABILITY_ALPHA),
-		# 注意力机制配置
-		"attention_layers": int(cfg.MODEL.ATTENTIONAL_LAYERS),
-		"refiner_type": str(cfg.MODEL.REFINER_TYPE),
-		'gcla_config': {
-			'k_scales': list(cfg.MODEL.GCLA.K_SCALES),
-			'geo_compress': int(cfg.MODEL.GCLA.GEO_COMPRESS),
-			'use_residual_scale': bool(cfg.MODEL.GCLA.USE_RESIDUAL_SCALE),
-			'residual_init': float(cfg.MODEL.GCLA.RESIDUAL_INIT),
-			'symmetric_coupling': bool(cfg.MODEL.GCLA.SYMMETRIC_COUPLING),
-			'use_stack_sum': bool(cfg.MODEL.GCLA.USE_STACK_SUM),
-			'gate_hidden': int(cfg.MODEL.GCLA.GATE_HIDDEN),
-		},
-		'gcdr_config': {
-			'geo_compress': int(cfg.MODEL.GCDR.GEO_COMPRESS),
-			'reliability_hidden': int(cfg.MODEL.GCDR.RELIABILITY_HIDDEN),
-			'gate_floor': float(cfg.MODEL.GCDR.GATE_FLOOR),
-			'reliability_loss_weight': float(cfg.MODEL.GCDR.RELIABILITY_LOSS_WEIGHT),
-			'reliability_consistency_weight': float(cfg.MODEL.GCDR.RELIABILITY_CONSISTENCY_WEIGHT),
-			'reliability_target_scale': float(cfg.MODEL.GCDR.RELIABILITY_TARGET_SCALE),
-		},
-		# 细化匹配器配置
-		"last_activation": str(cfg.MODEL.LAST_ACTIVATION),
-		# 模型输出维度
-		'output_dim': int(cfg.MODEL.OUTPUT_DIM),
-	}
+
+	model_config = get_model_config(cfg)
 
 	# GeoFeatModel will normalize key casing internally
 	if not model_config:
@@ -731,7 +667,7 @@ if __name__ == '__main__':
 		gamma_steplr=args.gamma_steplr,
 		training_res=args.training_res,
 		device_num=args.device_num,
-		use_dual_kpt_loss=args.use_dual_kpt_loss,
+		use_dual_kpt_loss=use_dual_kpt_loss,
 		dry_run=args.dry_run,
 		
 		# Status monitoring parameters
