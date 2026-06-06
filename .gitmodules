@@ -1,3 +1,6 @@
+[submodule "accelerated_features"]
+	path = 3rdparty/accelerated_features
+	url = https://github.com/verlab/accelerated_features
 [submodule "ALIKE"]
 	path = 3rdparty/ALIKE
 	url = https://github.com/Shiaoming/ALIKE

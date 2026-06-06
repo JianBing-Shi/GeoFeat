@@ -1,215 +1,199 @@
+import os
+import sys
+from typing import Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import sys
-import os
 
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.utils.depth_anything_wrapper import DepthAnythingExtractor
 
-# 计算高阶几何特征
-class GeometricComputer(nn.Module):
-    """
-    Compute geometric curvature features from depth maps.
-    Calculates:
-    - Gradients (grad_x, grad_y)
-    - Normal Vector (nx, ny, nz)
-    - Principal Curvatures (k1, k2)
-    - Gaussian Curvature (K)
-    - Mean Curvature (H)
-    - Shape Index (SI)
-    """
-    def __init__(self):
-        super().__init__()
-        # Sobel kernels for gradients
-        self.register_buffer('sobel_x', torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3))
-        self.register_buffer('sobel_y', torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3))
 
-    def compute_gradients(self, depth):
-        """Compute first and second order derivatives."""
-        # Pad for valid convolution
-        depth_pad = F.pad(depth, (1, 1, 1, 1), mode='replicate')
-        
-        # First order
+class GeometricExtractor(nn.Module):
+    """Compute and package depth-derived geometry for GeoFeat.
+
+    This class replaces the old split between GeometricComputer and
+    GeometricExtractor:
+    - compute_all(depth) returns all intermediate geometry terms for losses/debug.
+    - forward(..., return_all=False) returns model-facing compact geometry.
+
+    Model-facing gradients are the full first-order geometry group:
+    [grad_x, grad_y, normal_x, normal_y, normal_z].
+    """
+
+    DEFAULT_GEO_CFG = {
+        "depth": True,
+        "gradients": True,
+        "curvatures": True,
+    }
+
+    def __init__(
+        self,
+        model_config: Optional[dict] = None,
+        device: Optional[torch.device] = None,
+        enable_depth_extractor: bool = True,
+    ):
+        super().__init__()
+        self.geo_cfg = self._resolve_geo_cfg(model_config)
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.enable_depth_extractor = bool(enable_depth_extractor)
+        self.depth_extractor = None
+        if self.enable_depth_extractor:
+            self.depth_extractor = DepthAnythingExtractor("vits", self.device, 256)
+
+        self.register_buffer(
+            "sobel_x",
+            torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                dtype=torch.float32,
+            ).view(1, 1, 3, 3),
+        )
+        self.register_buffer(
+            "sobel_y",
+            torch.tensor(
+                [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                dtype=torch.float32,
+            ).view(1, 1, 3, 3),
+        )
+
+    @classmethod
+    def _resolve_geo_cfg(cls, model_config: Optional[dict]) -> dict:
+        if model_config is None:
+            return dict(cls.DEFAULT_GEO_CFG)
+        if "geometric_features" not in model_config:
+            raise KeyError("model_config must contain 'geometric_features'")
+
+        geo_cfg = dict(model_config["geometric_features"])
+        resolved = dict(cls.DEFAULT_GEO_CFG)
+        resolved.update({
+            "depth": bool(geo_cfg.get("depth", resolved["depth"])),
+            "gradients": bool(geo_cfg.get("gradients", resolved["gradients"])),
+            "curvatures": bool(geo_cfg.get("curvatures", resolved["curvatures"])),
+            "normal": False,
+        })
+        return resolved
+
+    def compute_derivatives(self, depth: torch.Tensor):
+        """Compute first- and second-order Sobel derivatives."""
+        depth_pad = F.pad(depth, (1, 1, 1, 1), mode="replicate")
         grad_x = F.conv2d(depth_pad, self.sobel_x)
         grad_y = F.conv2d(depth_pad, self.sobel_y)
-        
-        # Pad gradients for second order
-        grad_x_pad = F.pad(grad_x, (1, 1, 1, 1), mode='replicate')
-        grad_y_pad = F.pad(grad_y, (1, 1, 1, 1), mode='replicate')
-        
-        # Second order
+
+        grad_x_pad = F.pad(grad_x, (1, 1, 1, 1), mode="replicate")
+        grad_y_pad = F.pad(grad_y, (1, 1, 1, 1), mode="replicate")
         grad_xx = F.conv2d(grad_x_pad, self.sobel_x)
         grad_yy = F.conv2d(grad_y_pad, self.sobel_y)
         grad_xy = F.conv2d(grad_x_pad, self.sobel_y)
-        
         return grad_x, grad_y, grad_xx, grad_yy, grad_xy
 
-    def forward(self, depth):
-        """
-        Args:
-            depth: (B, 1, H, W) depth map
-        Returns:
-            dict containing geometric features
-        """
-        # We expect the input depth to be already normalized (e.g. [0, 1]) if needed.
-        # The caller (e.g. loss function) is responsible for normalization.
-        depth_norm = depth
+    def compute_all(self, depth: torch.Tensor) -> dict:
+        """Return all depth-derived geometry terms.
 
-        B, C, H, W = depth_norm.shape
-        
-        # 1. Compute derivatives
-        grad_x, grad_y, grad_xx, grad_yy, grad_xy = self.compute_gradients(depth_norm)
-        
-        # Compute Normal Vector
-        # Surface normal n = (-dz/dx, -dz/dy, 1) normalized
-        ones = torch.ones_like(grad_x)
-        normal = torch.cat((-grad_x, -grad_y, ones), dim=1)
-        normal = F.normalize(normal, dim=1)
-        
-        # 2. Compute Principal Curvatures
-        # Eigenvalues of Hessian: (trace +/- sqrt(trace^2 - 4*det)) / 2
+        Args:
+            depth: Normalized or caller-prepared depth map, (B, 1, H, W).
+        """
+        depth = depth.to(self.sobel_x.device)
+        grad_x, grad_y, grad_xx, grad_yy, grad_xy = self.compute_derivatives(depth)
+
+        normal = torch.cat((-grad_x, -grad_y, torch.ones_like(grad_x)), dim=1)
+        normal = F.normalize(normal, p=2, dim=1)
+
         trace = grad_xx + grad_yy
         det = grad_xx * grad_yy - grad_xy ** 2
-        
-        # Numerical stability
-        discriminant = torch.sqrt(torch.clamp(trace**2 - 4*det, min=1e-6))
-        
+        discriminant = torch.sqrt(torch.clamp(trace ** 2 - 4 * det, min=1e-6))
         k1 = (trace + discriminant) / 2.0
         k2 = (trace - discriminant) / 2.0
-        
-        # 3. Derived Curvatures
+
         gaussian_curv = k1 * k2
         mean_curv = (k1 + k2) / 2.0
-        
-        # 4. Shape Index
-        # SI = 2/pi * arctan((k2 + k1) / (k2 - k1))
-        # Avoid division by zero
+
         diff = k2 - k1
         diff = torch.where(torch.abs(diff) < 1e-6, torch.ones_like(diff) * 1e-6, diff)
         shape_index = (2.0 / 3.1415926) * torch.atan((k2 + k1) / diff)
-        
+
+        raw_gradients = torch.cat([grad_x, grad_y], dim=1)
+        gradients = torch.cat([raw_gradients, normal], dim=1)
         return {
-            'normal': normal,
-            'grad_x': grad_x,
-            'grad_y': grad_y,
-            'k1': k1,
-            'k2': k2,
-            'gaussian_curv': gaussian_curv,
-            'mean_curv': mean_curv,
-            'shape_index': shape_index
+            "depth": depth,
+            "grad_x": grad_x,
+            "grad_y": grad_y,
+            "raw_gradients": raw_gradients,
+            "normal": normal,
+            "gradients": gradients,
+            "curvatures": mean_curv,
+            "k1": k1,
+            "k2": k2,
+            "gaussian_curv": gaussian_curv,
+            "mean_curv": mean_curv,
+            "shape_index": shape_index,
         }
 
-# 计算所有的几何特征
-class GeometricExtractor(nn.Module):
-    """
-    Extracts multi-order geometric features from depth and normal maps.
-    """
-    def __init__(self, model_config):
-        super().__init__()
-        # expect explicit geometric_features flags; no defaults
-        if 'geometric_features' not in model_config:
-            raise KeyError("model_config must contain 'geometric_features'")
-        self.geo_cfg = model_config['geometric_features']
-        self.geometric_computer = GeometricComputer()
+    def _depth_from_image(self, image):
+        if self.depth_extractor is None:
+            raise RuntimeError("Depth extractor is disabled; pass depth directly or enable it.")
 
-        # Initialize DepthAnythingExtractor
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.depth_extractor = DepthAnythingExtractor('vits', self.device, 256)
-
-    def forward(self, depth=None, normal=None, image=None):
-        """
-        Args:
-            depth: (B, 1, H, W) tensor
-            normal: (B, 3, H, W) tensor
-            image: (B, 3, H, W) tensor or (H, W, 3) numpy array
-        Returns:
-            dict with all geometric features
-        """
-        if depth is None or normal is None:
-            if image is None:
-                raise ValueError("Must provide either (depth, normal) or image")
-            
-            # Compute depth and normal from image
-            if isinstance(image, torch.Tensor):
-                # Assume (B, 3, H, W)
-                B, C, H, W = image.shape
-                depth_list = []
-                normal_list = []
-                
-                # Move to cpu and numpy for DA3 wrapper
-                # Ensure image is in range [0, 255] and uint8
-                imgs_np = image.permute(0, 2, 3, 1).detach().cpu().numpy() # (B, H, W, 3)
-                
-                if imgs_np.max() <= 1.0 + 1e-6:
-                    imgs_np = (imgs_np * 255).astype(np.uint8)
-                else:
-                    imgs_np = imgs_np.astype(np.uint8)
-                    
-                for i in range(len(imgs_np)):
-                    # Pass target size (H, W) to extract
-                    target_size = (H, W)
-                    d, _, _, _ = self.depth_extractor.extract(imgs_np[i], target_size=target_size)
-                    depth_list.append(d)
-                    # normal_list.append(n)
-                
-                depth = torch.stack(depth_list).unsqueeze(1) # (B, 1, H, W)
-                # normal = torch.stack(normal_list).permute(0, 3, 1, 2) # (B, 3, H, W)
-                
-            elif isinstance(image, np.ndarray):
-                # Assume single numpy image (H, W, 3)
-                target_size = (image.shape[0], image.shape[1])
-                d, _, _, _ = self.depth_extractor.extract(image, target_size=target_size)
-                depth = d.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
-                # normal = n.permute(2, 0, 1).unsqueeze(0) # (1, 3, H, W)
+        if isinstance(image, torch.Tensor):
+            _, _, H, W = image.shape
+            imgs_np = image.permute(0, 2, 3, 1).detach().cpu().numpy()
+            if imgs_np.max() <= 1.0 + 1e-6:
+                imgs_np = (imgs_np * 255).astype(np.uint8)
             else:
-                 raise ValueError("Image must be torch.Tensor or numpy.ndarray")
+                imgs_np = imgs_np.astype(np.uint8)
 
-        # Compute 1-order (Gradients) and 2-order (Curvature) geometric features
-        # geometric_dict contains: grad_x, grad_y, k1, k2, gaussian_curv, mean_curv, shape_index
-        geometric_dict = self.geometric_computer(depth)
-        
+            depth_list = []
+            for img in imgs_np:
+                d, _, _, _ = self.depth_extractor.extract(img, target_size=(H, W))
+                depth_list.append(d)
+            return torch.stack(depth_list).unsqueeze(1)
+
+        if isinstance(image, np.ndarray):
+            target_size = (image.shape[0], image.shape[1])
+            d, _, _, _ = self.depth_extractor.extract(image, target_size=target_size)
+            return d.unsqueeze(0).unsqueeze(0)
+
+        raise ValueError("Image must be torch.Tensor or numpy.ndarray")
+
+    def forward(self, depth=None, normal=None, image=None, return_all: bool = False):
+        """Compute geometry from depth or image.
+
+        Args:
+            depth: Optional depth map, (B, 1, H, W).
+            normal: Unused legacy argument kept for caller compatibility.
+            image: Optional RGB image tensor or numpy image used to infer depth.
+            return_all: If true, return all computed geometry terms.
+        """
+        del normal
+        if depth is None:
+            if image is None:
+                raise ValueError("Must provide either depth or image")
+            depth = self._depth_from_image(image)
+
+        all_features = self.compute_all(depth.to(self.device))
+        if return_all:
+            return all_features
+
         geo_features = {}
-        
-        # 0-order
-        if self.geo_cfg['depth']:
-            geo_features['depth'] = depth
-
-        # 1-order
-        if self.geo_cfg['normal']:
-            geo_features['normal'] = geometric_dict['normal']
-
-        # Gradients
-        if self.geo_cfg['gradients']:
-            geo_features['grad_x'] = geometric_dict['grad_x']
-            geo_features['grad_y'] = geometric_dict['grad_y']
-
-        # Curvatures
-        if self.geo_cfg['curvatures']:
-            geo_features['k1'] = geometric_dict['k1']
-            geo_features['k2'] = geometric_dict['k2']
-            geo_features['gaussian_curv'] = geometric_dict['gaussian_curv']
-            geo_features['mean_curv'] = geometric_dict['mean_curv']
-            geo_features['shape_index'] = geometric_dict['shape_index']
-        
+        if self.geo_cfg["depth"]:
+            geo_features["depth"] = all_features["depth"]
+        if self.geo_cfg["gradients"]:
+            geo_features["gradients"] = all_features["gradients"]
+        if self.geo_cfg["curvatures"]:
+            geo_features["curvatures"] = all_features["curvatures"]
         return geo_features
 
 if __name__ == "__main__":
     print("=== Verifying GeometricExtractor ===")
-    
-    # Mock config
     model_config = {
         "geometric_features": {
             "depth": True,
-            "normal": True,
             "gradients": True,
-            "curvatures": True
+            "curvatures": True,
         }
     }
-    
-    # Initialize
+
     print("Initializing GeometricExtractor...")
     try:
         extractor = GeometricExtractor(model_config)
@@ -219,29 +203,19 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[Error] Initialization failed: {e}")
         sys.exit(1)
-        
-    # Dummy Input
-    H, W = 480, 640
+
+    H, W = 640, 800
     dummy_img = np.random.randint(0, 255, (H, W, 3), dtype=np.uint8)
-    
-    # Forward
+
     print(f"Running inference on image shape {dummy_img.shape}...")
-    try:
-        # GeometricExtractor.forward handles numpy image by calling depth_extractor.extract
-        features = extractor(image=dummy_img)
-        
-        print("[Success] Inference complete")
-        print("Output features:")
-        for k, v in features.items():
-            print(f"  {k}: {v.shape}")
-            
-        # Check resolution
-        if features['depth'].shape[-2:] == (H, W):
-            print("[Pass] Output resolution matches input")
-        else:
-            print(f"[Fail] Output resolution mismatch: {features['depth'].shape[-2:]} vs {(H, W)}")
-            
-    except Exception as e:
-        print(f"[Error] Inference failed: {e}")
-        import traceback
-        traceback.print_exc()
+    features = extractor(image=dummy_img)
+
+    print("[Success] Inference complete")
+    print("Output features:")
+    for k, v in features.items():
+        print(f"  {k}: {v.shape}")
+
+    if features["depth"].shape[-2:] == (H, W):
+        print("[Pass] Output resolution matches input")
+    else:
+        print(f"[Fail] Output resolution mismatch: {features['depth'].shape[-2:]} vs {(H, W)}")

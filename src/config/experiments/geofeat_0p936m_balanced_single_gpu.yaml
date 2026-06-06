@@ -1,0 +1,64 @@
+# GeoFeat 0.936M Balanced Single-GPU Training
+# Goal: use one config for the sub-1M mainline on a single available GPU.
+# The reliability/repeatability losses are kept mild so the model can train
+# stably without a separate warmup/finetune config.
+
+DATASET:
+  USE_MEGADEPTH: true
+  USE_COCO: true
+  MEGADEPTH_BATCH_SIZE: 1
+  COCO_BATCH_SIZE: 1
+
+MODEL:
+  BACKBONE: "Standard"
+
+  DESCRIPTOR_DIM: 96
+  DESCRIPTOR_ENCODER: [96]
+  OUTPUT_DIM: 96
+
+  GEOMETRIC_FEATURES:
+    DEPTH: true
+    GRADIENTS: true
+    CURVATURES: true
+
+  DEPTH_ENCODER: [32, 48]
+  DEPTH_DIM: 96
+  GRADIENT_ENCODER: [48, 64]
+  GRADIENT_DIM: 96
+  CURVATURE_ENCODER: [32, 48]
+  CURVATURE_DIM: 96
+
+  GEO_PREPROCESS_MODE: "no_unfold_lite"
+  REFINER_TYPE: "GCDR"
+  REPEATABILITY_ALPHA: 0.35
+
+  ATTENTIONAL_LAYERS: 2
+  AFT:
+    NUM_GROUPS: 4
+    LOCAL_KERNEL_SIZES: [3, 5]
+    DOMAIN_ADAPT: true
+    TEMPERATURE_MIN: 0.70
+    TEMPERATURE_MAX: 1.60
+    LOCAL_BASE_GAIN: 1.0
+    CORR_BASE_GAIN: 0.5
+
+  GEO_CROSS_ATTENTION:
+    ENABLED: true
+    NUM_GROUPS: 4
+    GATE_INIT: -2.0
+
+  GCDR:
+    GEO_COMPRESS: 12
+    RELIABILITY_HIDDEN: 12
+    GATE_FLOOR: 0.10
+    RESIDUAL_GAIN: 0.60
+    RESIDUAL_GATE_FLOOR: 0.10
+
+LOSS:
+  RELIABILITY_LOSS_WEIGHT: 0.25
+  RELIABILITY_CONSISTENCY_WEIGHT: 0.25
+  RELIABILITY_TARGET_SCALE: 6.0
+  REPEATABILITY_LOSS_WEIGHT: 0.03
+
+TRAIN:
+  USE_DUAL_KPT_LOSS: true

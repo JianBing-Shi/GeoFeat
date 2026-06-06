@@ -29,8 +29,6 @@ REQUIRED_MODEL_CONFIG_KEYS = {
 	"geometric_features",
 	"depth_encoder",
 	"depth_dim",
-	"normal_encoder",
-	"normal_dim",
 	"gradient_encoder",
 	"gradient_dim",
 	"curvature_encoder",
@@ -60,15 +58,19 @@ def validate_model_config(model_config: Optional[dict]) -> dict:
 			"model_config is missing required keys: " + ", ".join(missing)
 		)
 
-	geo_cfg = model_config.get("geometric_features")
+	cfg = dict(model_config)
+	geo_cfg = cfg.get("geometric_features")
 	if not isinstance(geo_cfg, dict):
 		raise ValueError("model_config['geometric_features'] must be a dict")
 
-	for key in ("depth", "normal", "gradients", "curvatures"):
+	geo_cfg = dict(geo_cfg)
+	for key in ("depth", "gradients", "curvatures"):
 		if key not in geo_cfg:
 			raise ValueError(f"model_config['geometric_features'] missing key: {key}")
+	geo_cfg.setdefault("normal", False)
+	cfg["geometric_features"] = geo_cfg
 
-	return model_config
+	return cfg
 
 
 def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
@@ -82,11 +84,33 @@ def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
 	fallbacks = {
 		"repeatability_alpha": 0.0,
 		"geo_preprocess_mode": "no_unfold_lite",
+		"aft_config": {
+			"num_groups": 4,
+			"local_kernel_sizes": [3, 5, 7],
+			"domain_adapt": True,
+			"temperature_min": 0.70,
+			"temperature_max": 1.60,
+			"local_base_gain": 1.0,
+			"corr_base_gain": 0.5,
+		},
+		"geo_cross_attention": {
+			"enabled": True,
+			"num_groups": 4,
+			"gate_init": -2.0,
+		},
 	}
 	for key, value in fallbacks.items():
 		if key not in cfg:
 			cfg[key] = value
 			print(f"Warning: model_config missing '{key}'; fallback to {value!r}.")
+	geo_cfg = cfg.get("geometric_features")
+	if isinstance(geo_cfg, dict):
+		geo_cfg = dict(geo_cfg)
+		if bool(geo_cfg.get("normal", False)):
+			geo_cfg["gradients"] = True
+			print("Warning: merged legacy standalone normal geometry into 'gradients'.")
+		geo_cfg["normal"] = False
+		cfg["geometric_features"] = geo_cfg
 	return cfg
 
 
@@ -205,10 +229,13 @@ class GeoFeat:
 		top_k: int = 4096,
 		detect_threshold: float = 0.05,
 		nms_kernel_size: int = 7,
-		match_min_cossim: float = 0.1,
-		match_ratio_thresh: float = 0.82,
+		match_min_cossim: float = 0.05,       # Dynamically adjusted from 0.1 for richer match pools in indoor low-texture scene
+		match_ratio_thresh: float = 0.85,     # Broadened from 0.82 to fit close-range rotation warping
 		descriptor_source: str = "refined",
 		keypoint_source: str = "refined",
+		descriptor_confidence_gain: float = 0.0,
+		repeatability_adaptive_gamma: float = 0.0,
+		force_bn_train: bool = True,          # Changed to True: Domain adaptation for indoor test distributions
 	):
 		self.device = device
 		self.top_k = top_k
@@ -222,10 +249,15 @@ class GeoFeat:
 			raise ValueError(f"descriptor_source must be one of {sorted(valid_sources)}, got {descriptor_source}")
 		if self.keypoint_source not in valid_sources:
 			raise ValueError(f"keypoint_source must be one of {sorted(valid_sources)}, got {keypoint_source}")
-		self.model_config = validate_model_config(model_config)
+		base_config = validate_model_config(model_config)
+		self.model_config = dict(base_config)
+		self.model_config["descriptor_confidence_gain"] = float(descriptor_confidence_gain)
+		self.model_config["repeatability_adaptive_gamma"] = float(repeatability_adaptive_gamma)
 
 		self.net = GeoFeatModel(self.model_config).to(self.device).eval()
 		self.net = cast(GeoFeatModel, load_model(self.net, weight_path))
+		self.force_bn_train = force_bn_train
+		self._apply_bn_train_mode()
 
 		self.detector = NonMaxSuppression(
 			rep_thr=detect_threshold,
@@ -233,6 +265,13 @@ class GeoFeat:
 			kernel_size=nms_kernel_size,
 		).to(self.device)
 		self.sampler = InterpolateSparse2d("bicubic").to(self.device)
+
+	def _apply_bn_train_mode(self) -> None:
+		if getattr(self, "force_bn_train", False):
+			for m in self.net.modules():
+				if isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+					m.train()
+					m.track_running_stats = True
 
 	@staticmethod
 	def _pad_size(length: int, divisor: int = 32) -> Tuple[int, int]:
@@ -351,6 +390,7 @@ class GeoFeat:
 			)
 
 		_, _, padded_h, padded_w = image_tensor.shape
+		self._apply_bn_train_mode()
 		descs_map, heatmap = self._run_model_two_stage(image_tensor)
 
 		pos = self.detector(heatmap)

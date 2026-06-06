@@ -1,6 +1,6 @@
-# GeoFeat Mainline Framework Diagram
+# GeoFeat Correct Framework Diagram
 
-This diagram matches the converged mainline in [src/model/GeoFeatModel.py](src/model/GeoFeatModel.py): `train.py` is the only supported training entrypoint, and `GCDR` is the fixed descriptor refiner path.
+This diagram matches the current implementation in src/model/GeoFeatModel.py.
 
 ```mermaid
 flowchart LR
@@ -16,14 +16,29 @@ flowchart LR
     GP -->|no_unfold_lite| GN[Resize geo map to descriptor resolution]
 
     DH --> DE[Descriptor Encoder]
-    GU --> GE[Per-branch Geo Encoders]
+    GU --> GE[Per-branch Geo Encoders + Branch Gates]
     GN --> GE
     GE --> ADD1((Add))
     DE --> ADD1
 
-    ADD1 --> GCDR[GCDR Pre-Attention Refinement]
+    ADD1 --> RSEL{REFINER_TYPE}
+
+    RSEL -->|GCDR| GCDR[GCDR Pre-Attention Refinement]
     GCDR --> AFT[AttentionalNN with AFT Blocks]
-    AFT --> NORM[L2 Normalize]
+
+    RSEL -->|None| AFT
+    RSEL -->|Local| AFT
+    RSEL -->|GCLA| AFT
+
+    AFT --> POST{REFINER_TYPE}
+    POST -->|Local| LREF[Local Refiner]
+    POST -->|GCLA| GCLA[GCLA Refiner]
+    POST -->|None or GCDR| BYP[Bypass]
+
+    LREF --> NORM[L2 Normalize]
+    GCLA --> NORM
+    BYP --> NORM
+
     NORM --> DOUT[Descriptor Output 64D]
 
     NORM --> REP[Repeatability Head]
@@ -34,6 +49,8 @@ flowchart LR
 
     style GCDR fill:#ffe9c6,stroke:#333,stroke-width:1.5px
     style AFT fill:#dceeff,stroke:#333,stroke-width:1.2px
+    style GCLA fill:#e8f7e8,stroke:#333,stroke-width:1.2px
+    style LREF fill:#e8f7e8,stroke:#333,stroke-width:1.2px
 ```
 
 ## GCDR Internal Expansion
@@ -43,18 +60,54 @@ flowchart TD
     D0[Descriptor map] --> D1[Convert NHWC to NCHW]
     G0[Geo map] --> G1[Geo Projection 1x1 Conv + BN + GELU]
 
-    G1 --> GF[Compressed geo feature]
+    G1 --> C1{LOCAL_CONTEXT_LAYERS > 0}
+    C1 -->|Yes| C2[GeoContextBlock x L]
+    C1 -->|No| C3[Bypass]
+
+    C2 --> M0
+    C3 --> M0
+
+    M0{USE_MULTI_SCALE_GEO}
+    M0 -->|Yes| M1[Depthwise Conv over MS_K_SCALES + learnable scale weights]
+    M0 -->|No| M2[Single-scale geo feature]
+
+    M1 --> GF[Geo feature]
+    M2 --> GF
+
     D1 --> CAT[Concat desc and geo]
     GF --> CAT
 
     CAT --> REL[Reliability Head]
     REL --> R[Sigmoid reliability map]
-    R --> GATE[Gate with floor]
 
-    GF --> FILM[FiLM generator]
-    FILM --> MOD[Residual build]
-    GATE --> OUT[Desc + residual_gain * gate * residual]
-    MOD --> OUT
+    GF --> FILM[FiLM Gen: produce scale and shift]
+    FILM --> MOD[Residual build: d*scale + shift]
+
+    R --> GATE[Gate with floor]
+    GATE --> MOD
+
+    CAT --> CG{USE_CHANNEL_GATE}
+    CG -->|Yes| CAG[Per-channel gain]
+    CG -->|No| CSK[Skip]
+    MOD --> MOD2
+    CAG --> MOD2[Residual update]
+    CSK --> MOD2
+
+    R --> RG{USE_RESIDUAL_GATE}
+    RG -->|Yes| RGG[Residual gate]
+    RG -->|No| RGS[Skip]
+
+    CAT --> CSG{USE_COUPLED_SCALE_GATE}
+    CSG -->|Yes| CSGG[Coupled gate]
+    CSG -->|No| CSGS[Skip]
+
+    RGG --> GM[Compose final gate]
+    RGS --> GM
+    CSGG --> GM
+    CSGS --> GM
+
+    MOD2 --> OUT[Desc + residual_gain * gate * residual]
+    GM --> OUT
     OUT --> LN[LayerNorm]
     LN --> DOUT2[Refined descriptor]
     R --> ROUT[Geo reliability map]
@@ -63,11 +116,3 @@ flowchart TD
     style FILM fill:#ffe9c6,stroke:#333,stroke-width:1.2px
     style LN fill:#dceeff,stroke:#333,stroke-width:1.2px
 ```
-
-## Mainline Config Mapping
-
-- `MODEL.REFINER_TYPE`: current mainline uses `GCDR`.
-- `MODEL.GCDR.GEO_COMPRESS`: geometry compression width.
-- `MODEL.GCDR.RELIABILITY_HIDDEN`: hidden width of the reliability head.
-- `MODEL.GCDR.GATE_FLOOR`, `RESIDUAL_GAIN`, `RESIDUAL_GATE_FLOOR`: residual injection strength and lower bounds.
-- `LOSS.RELIABILITY_LOSS_WEIGHT`, `RELIABILITY_CONSISTENCY_WEIGHT`, `RELIABILITY_TARGET_SCALE`: reliability supervision terms used by the training loss.

@@ -22,30 +22,30 @@ cfg.MODEL = CN()
 # Backbone options: "Standard", "RepVGG"
 cfg.MODEL.BACKBONE = "Standard"        
 
-cfg.MODEL.KEYPOINT_DIM = 65
 cfg.MODEL.KEYPOINT_ENCODER = [128, 64, 64]
+cfg.MODEL.KEYPOINT_DIM = 65
 
-cfg.MODEL.DESCRIPTOR_DIM = 64
-cfg.MODEL.DESCRIPTOR_ENCODER = [64, 64]
+cfg.MODEL.DESCRIPTOR_ENCODER = [96]
+cfg.MODEL.DESCRIPTOR_DIM = 96
 
-# Normal, Gradient, and Curvature feature encoders
+# Geometry feature switches. Mainline compact geometry uses:
+# - depth: 1 channel
+# - gradients: 5 channels [dx, dy, normal_x, normal_y, normal_z]
+# - curvatures: 1 channel mean curvature
+# Normal is merged into GRADIENTS because both are first-order geometry.
 cfg.MODEL.GEOMETRIC_FEATURES = CN()
 cfg.MODEL.GEOMETRIC_FEATURES.DEPTH = True
-cfg.MODEL.GEOMETRIC_FEATURES.NORMAL = True
 cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS = True
 cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES = True
 
-cfg.MODEL.DEPTH_ENCODER = [128, 64, 64]
-cfg.MODEL.DEPTH_DIM = 64
+cfg.MODEL.DEPTH_ENCODER = [32, 48]
+cfg.MODEL.DEPTH_DIM = 96
 
-cfg.MODEL.NORMAL_ENCODER = [128, 64, 64]
-cfg.MODEL.NORMAL_DIM = 192
+cfg.MODEL.GRADIENT_ENCODER = [48, 64]
+cfg.MODEL.GRADIENT_DIM = 96
 
-cfg.MODEL.GRADIENT_ENCODER = [64, 32, 32]
-cfg.MODEL.GRADIENT_DIM = 128
-
-cfg.MODEL.CURVATURE_ENCODER = [64, 32, 32]
-cfg.MODEL.CURVATURE_DIM = 64
+cfg.MODEL.CURVATURE_ENCODER = [32, 48]
+cfg.MODEL.CURVATURE_DIM = 96
 
 # Geometry preprocessing mode before FeatureBooster:
 # - "unfold": original 8x8 unfold to tokenized geometry channels
@@ -53,7 +53,20 @@ cfg.MODEL.CURVATURE_DIM = 64
 cfg.MODEL.GEO_PREPROCESS_MODE = "no_unfold_lite"
 
 # Attention configuration
-cfg.MODEL.ATTENTIONAL_LAYERS = 3
+cfg.MODEL.ATTENTIONAL_LAYERS = 2
+cfg.MODEL.AFT = CN()
+cfg.MODEL.AFT.NUM_GROUPS = 4
+cfg.MODEL.AFT.LOCAL_KERNEL_SIZES = [3, 5]
+cfg.MODEL.AFT.DOMAIN_ADAPT = True
+cfg.MODEL.AFT.TEMPERATURE_MIN = 0.70
+cfg.MODEL.AFT.TEMPERATURE_MAX = 1.60
+cfg.MODEL.AFT.LOCAL_BASE_GAIN = 1.0
+cfg.MODEL.AFT.CORR_BASE_GAIN = 0.5
+
+cfg.MODEL.GEO_CROSS_ATTENTION = CN()
+cfg.MODEL.GEO_CROSS_ATTENTION.ENABLED = True
+cfg.MODEL.GEO_CROSS_ATTENTION.NUM_GROUPS = 4
+cfg.MODEL.GEO_CROSS_ATTENTION.GATE_INIT = -2.0
 
 # Refiner options: "None", "GCDR"
 cfg.MODEL.REFINER_TYPE = "GCDR"
@@ -61,9 +74,9 @@ cfg.MODEL.REFINER_TYPE = "GCDR"
 # Fixed path: geometry compression -> reliability-aware FiLM -> residual gated injection.
 cfg.MODEL.GCDR = CN()
 # 压缩几何特征通道数，控制几何条件分支的信息瓶颈与计算量。
-cfg.MODEL.GCDR.GEO_COMPRESS = 16      # geo compression channels (7->8 for no_unfold_lite)
+cfg.MODEL.GCDR.GEO_COMPRESS = 12      # geo compression channels (7->8 for no_unfold_lite)
 # reliability head 的隐藏通道数，决定可靠性估计分支的容量。
-cfg.MODEL.GCDR.RELIABILITY_HIDDEN = 16
+cfg.MODEL.GCDR.RELIABILITY_HIDDEN = 12
 # FiLM 门控下限，避免 reliability 很低时几何调制完全退化为 0。
 cfg.MODEL.GCDR.GATE_FLOOR = 0.10
 # 几何残差注入强度，值越大表示 descriptor refinement 越激进。
@@ -78,6 +91,8 @@ cfg.LOSS.RELIABILITY_LOSS_WEIGHT = 0.0
 cfg.LOSS.RELIABILITY_CONSISTENCY_WEIGHT = 0.25
 # 将 refined/raw confidence 差值映射为 reliability target 时的 sigmoid 缩放系数。
 cfg.LOSS.RELIABILITY_TARGET_SCALE = 6.0
+# 重复性一致性损失权重，约束配对图像间的关键点检测稳定性。
+cfg.LOSS.REPEATABILITY_LOSS_WEIGHT = 0.0
 # 重复性图的权重系数，控制其对关键点预测的影响程度
 # ALPHA小：更依赖原始关键点预测；
 # ALPHA大：更依赖重复性图进行调整
@@ -87,7 +102,7 @@ cfg.MODEL.REPEATABILITY_ALPHA = 0.35
 # Final activation for descriptors: "None", "relu", "sigmoid", "tanh"
 cfg.MODEL.LAST_ACTIVATION = "None"
 
-cfg.MODEL.OUTPUT_DIM = 64
+cfg.MODEL.OUTPUT_DIM = 96
 
 def get_data_config(cfg_node=None):
 	"""Build the runtime data config dict used by entrypoints."""
@@ -109,6 +124,7 @@ def get_loss_config(cfg_node=None):
 		'reliability_loss_weight': float(active_cfg.LOSS.RELIABILITY_LOSS_WEIGHT),
 		'reliability_consistency_weight': float(active_cfg.LOSS.RELIABILITY_CONSISTENCY_WEIGHT),
 		'reliability_target_scale': float(active_cfg.LOSS.RELIABILITY_TARGET_SCALE),
+		'repeatability_loss_weight': float(active_cfg.LOSS.REPEATABILITY_LOSS_WEIGHT),
 	}
 
 
@@ -123,14 +139,14 @@ def get_model_config(cfg_node=None):
 		'descriptor_dim': int(active_cfg.MODEL.DESCRIPTOR_DIM),
 		'geometric_features': {
 			'depth': bool(active_cfg.MODEL.GEOMETRIC_FEATURES.DEPTH),
-			'normal': bool(active_cfg.MODEL.GEOMETRIC_FEATURES.NORMAL),
+			# Legacy compatibility field. Standalone normal is disabled because
+			# normals are now packed into gradients as first-order geometry.
+			'normal': False,
 			'gradients': bool(active_cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS),
 			'curvatures': bool(active_cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES),
 		},
 		'depth_encoder': list(active_cfg.MODEL.DEPTH_ENCODER),
 		'depth_dim': int(active_cfg.MODEL.DEPTH_DIM),
-		'normal_encoder': list(active_cfg.MODEL.NORMAL_ENCODER),
-		'normal_dim': int(active_cfg.MODEL.NORMAL_DIM),
 		'gradient_encoder': list(active_cfg.MODEL.GRADIENT_ENCODER),
 		'gradient_dim': int(active_cfg.MODEL.GRADIENT_DIM),
 		'curvature_encoder': list(active_cfg.MODEL.CURVATURE_ENCODER),
@@ -138,6 +154,20 @@ def get_model_config(cfg_node=None):
 		'geo_preprocess_mode': str(active_cfg.MODEL.GEO_PREPROCESS_MODE),
 		'repeatability_alpha': float(active_cfg.MODEL.REPEATABILITY_ALPHA),
 		'attention_layers': int(active_cfg.MODEL.ATTENTIONAL_LAYERS),
+		'aft_config': {
+			'num_groups': int(active_cfg.MODEL.AFT.NUM_GROUPS),
+			'local_kernel_sizes': list(active_cfg.MODEL.AFT.LOCAL_KERNEL_SIZES),
+			'domain_adapt': bool(active_cfg.MODEL.AFT.DOMAIN_ADAPT),
+			'temperature_min': float(active_cfg.MODEL.AFT.TEMPERATURE_MIN),
+			'temperature_max': float(active_cfg.MODEL.AFT.TEMPERATURE_MAX),
+			'local_base_gain': float(active_cfg.MODEL.AFT.LOCAL_BASE_GAIN),
+			'corr_base_gain': float(active_cfg.MODEL.AFT.CORR_BASE_GAIN),
+		},
+		'geo_cross_attention': {
+			'enabled': bool(active_cfg.MODEL.GEO_CROSS_ATTENTION.ENABLED),
+			'num_groups': int(active_cfg.MODEL.GEO_CROSS_ATTENTION.NUM_GROUPS),
+			'gate_init': float(active_cfg.MODEL.GEO_CROSS_ATTENTION.GATE_INIT),
+		},
 		'refiner_type': str(active_cfg.MODEL.REFINER_TYPE),
 		'gcdr_config': {
 			'geo_compress': int(active_cfg.MODEL.GCDR.GEO_COMPRESS),

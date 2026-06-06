@@ -20,6 +20,8 @@ def parse_arguments():
 	parser.add_argument('--name', type=str, default='GeoFeat', help='set process name')
 	parser.add_argument('--config_file', type=str, default='',
 						help='Optional YAML config path merged on top of default config.')
+	parser.add_argument('--init_weights', type=str, default='',
+						help='Optional checkpoint path used to initialize model weights before training.')
 
 	# training setting
 	# 保存权重
@@ -97,6 +99,7 @@ class Trainer():
 				data_config, model_config,
 				model_name='GeoFeat',
 				ckpt_save_path="./weights",
+				init_weights='',
 				n_steps=30_000,
 				save_ckpt_every=1000,
 				lr=3e-4, gamma_steplr=0.5,
@@ -135,6 +138,16 @@ class Trainer():
 
 		# training model - Pass model config to GeoFeatModel
 		self.net = GeoFeatModel(model_config=self.model_config).to(self.dev)
+		if init_weights:
+			ckpt_path = os.path.abspath(init_weights)
+			if not os.path.isfile(ckpt_path):
+				raise FileNotFoundError(f"init_weights not found: {ckpt_path}")
+			state = torch.load(ckpt_path, map_location=self.dev)
+			if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
+				state = state['state_dict']
+			missing, unexpected = self.net.load_state_dict(state, strict=False)
+			print(f"Loaded init weights from {ckpt_path}")
+			print(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
 		refiner_type = str(self.model_config.get('refiner_type', 'None'))
 		if refiner_type == 'GCDR':
 			if getattr(self.net.attn_fusion, 'pre_attn_refiner', None) is None:
@@ -150,6 +163,8 @@ class Trainer():
 		if refiner_type == 'GCDR':
 			reliability_loss_weight = float(loss_cfg.get('reliability_loss_weight', 1.0))
 
+		repeatability_loss_weight = float(loss_cfg.get('repeatability_loss_weight', 0.1))
+
 		self.loss_fn = GeoFeatLoss(
 			self.dev, 
 			lam_descs=1, 
@@ -158,6 +173,7 @@ class Trainer():
 			lam_kpts_raw=2,
 			lam_heatmap=1,
 			lam_reliability=reliability_loss_weight,
+			lam_repeatability=repeatability_loss_weight,
 			reliability_consistency_weight=float(loss_cfg.get('reliability_consistency_weight', 0.25)),
 			reliability_target_scale=float(loss_cfg.get('reliability_target_scale', 6.0)),
 			geo_config=geo_config
@@ -246,6 +262,7 @@ class Trainer():
 				"gamma_steplr": gamma_steplr,
 				"training_res": list(training_res),
 				"device": str(self.dev),
+				"init_weights": str(init_weights) if init_weights else "",
 			},
 			"data_config": self.data_config,
 			"model_config": self.model_config,
@@ -286,7 +303,7 @@ class Trainer():
 				f.write('global_step,loss,' \
 						'loss_descs,acc_coarse,' \
 						'loss_fb_descs,acc_fb_coarse,' \
-						'loss_kpts,loss_kpts_raw,loss_kpts_refined,loss_reliability,kpt_raw_weight,kpt_refined_weight,' \
+						'loss_kpts,loss_kpts_raw,loss_kpts_refined,loss_reliability,loss_repeatability,kpt_raw_weight,kpt_refined_weight,' \
 						'loss_depths,loss_normals,loss_gradients,loss_curvature,' \
 						'total_pos,lr,forward_cost\n')
 			print(f"Status file initialized: {self.status_path}")
@@ -422,6 +439,7 @@ class Trainer():
 
 				fb_feats1,fb_feats2=[],[]
 				geo_reliability1, geo_reliability2 = [], []
+				repeatability1, repeatability2 = [], []
 				kpt_maps1_refined, kpt_maps2_refined = [], []
 				for b in range(des_feats1.shape[0]):
 					feat1=des_feats1[b].permute(1,2,0).reshape(-1,des_feats1.shape[1])
@@ -450,6 +468,10 @@ class Trainer():
 						geo_reliability1.append(aux1['geo_reliability_map'])
 					if 'geo_reliability_map' in aux2:
 						geo_reliability2.append(aux2['geo_reliability_map'])
+					if 'repeatability_map' in aux1:
+						repeatability1.append(aux1['repeatability_map'])
+					if 'repeatability_map' in aux2:
+						repeatability2.append(aux2['repeatability_map'])
 					
 					img1,img2=imgs1_t[b],imgs2_t[b]
 					img1=img1.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
@@ -470,6 +492,8 @@ class Trainer():
 				fb_feats2=torch.cat(fb_feats2,dim=0)
 				geo_reliability1 = torch.cat(geo_reliability1, dim=0) if geo_reliability1 else None
 				geo_reliability2 = torch.cat(geo_reliability2, dim=0) if geo_reliability2 else None
+				repeatability1 = torch.cat(repeatability1, dim=0) if repeatability1 else None
+				repeatability2 = torch.cat(repeatability2, dim=0) if repeatability2 else None
 				keypoint_map1_refined = torch.cat(kpt_maps1_refined, dim=0)
 				keypoint_map2_refined = torch.cat(kpt_maps2_refined, dim=0)
 				# Flattening/Reshaping removed as forward2 now returns (B, C, H, W) maps directly
@@ -492,6 +516,8 @@ class Trainer():
 					self.megadepth_batch_size, self.coco_batch_size,
 					reliability1=geo_reliability1,
 					reliability2=geo_reliability2,
+					repeatability1=repeatability1,
+					repeatability2=repeatability2,
 					raw_kpts1=keypoint_map1,
 					raw_kpts2=keypoint_map2,
 					refined_kpts1=keypoint_map1_refined,
@@ -511,6 +537,7 @@ class Trainer():
 				loss_kpts_raw = loss_info.get('loss_kpts_raw', torch.tensor(0.0, device=self.dev))
 				loss_kpts_refined = loss_info.get('loss_kpts_refined', torch.tensor(0.0, device=self.dev))
 				loss_reliability = loss_info.get('loss_reliability', torch.tensor(0.0, device=self.dev))
+				loss_repeatability = loss_info.get('loss_repeatability', torch.tensor(0.0, device=self.dev))
 				kpt_raw_weight = float(loss_info.get('kpt_raw_weight', kpt_raw_weight))
 				kpt_refined_weight = float(loss_info.get('kpt_refined_weight', kpt_refined_weight))
 				acc_kpt = loss_info['acc_kpt']
@@ -526,14 +553,14 @@ class Trainer():
 				if self.model_config.get('refiner_type') == 'GCDR':
 					loss_items.append(loss_reliability.unsqueeze(0))
 				
+				loss_items.append(loss_repeatability.unsqueeze(0))
+
 				# Add geometric losses if enabled
 				geo_config = self.model_config['geometric_features']
 				if geo_config['depth']:
 					loss_items.append(loss_depths.unsqueeze(0))     	# 深度损失
-				if geo_config['normal']:
-					loss_items.append(loss_normals.unsqueeze(0))    	# 法向量损失
 				if geo_config['gradients']:
-					loss_items.append(loss_gradients.unsqueeze(0))  	# 梯度损失
+					loss_items.append(loss_gradients.unsqueeze(0))  	# first-order loss: dx/dy + normals
 				if geo_config['curvatures']:
 					loss_items.append(loss_curvature.unsqueeze(0))  	# 曲率损失
 
@@ -555,12 +582,6 @@ class Trainer():
 					print('saving iter ', global_step)
 					ckpt_path = os.path.join(self.ckpt_dir, f'{self.model_name}_step{global_step}.pth')
 					torch.save(self.net.state_dict(), ckpt_path)
-				
-				# 保存最佳权重文件
-				if acc_fb_coarse > best_metric:
-					best_metric = acc_fb_coarse
-					best_ckpt_path = os.path.join(self.ckpt_dir, f'{self.model_name}_{global_step}best.pth')
-					torch.save(self.net.state_dict(), best_ckpt_path)
 
 				# 打印训练过程(损失函数) - 使用 tqdm.write 分行输出详细信息，避免单行过长
 				pbar.set_description(f'Loss/total: {loss.item():.4f} Accuracy/acc_fb_coarse: {acc_fb_coarse:.3f}')
@@ -582,6 +603,7 @@ class Trainer():
 				self.writer.add_scalar('Loss/kpts_raw', loss_kpts_raw.item(), global_step)
 				self.writer.add_scalar('Loss/kpts_refined', loss_kpts_refined.item(), global_step)
 				self.writer.add_scalar('Loss/reliability', loss_reliability.item(), global_step)
+				self.writer.add_scalar('Loss/repeatability', loss_repeatability.item(), global_step)
 				self.writer.add_scalar('Loss/kpt_raw_weight', kpt_raw_weight, global_step)
 				self.writer.add_scalar('Loss/kpt_refined_weight', kpt_refined_weight, global_step)
 				self.writer.add_scalar('Loss/depths', loss_depths.item(), global_step)
@@ -596,7 +618,9 @@ class Trainer():
 						f.write(f"{global_step},{loss.item():.6f},"
 								f"{loss_descs.item():.6f},{acc_coarse:.4f},"
 								f"{loss_fb_descs.item():.6f},{acc_fb_coarse:.4f},"
-								f"{loss_kpts.item():.6f},{loss_kpts_raw.item():.6f},{loss_kpts_refined.item():.6f},{loss_reliability.item():.6f},{kpt_raw_weight:.4f},{kpt_refined_weight:.4f},"
+								f"{loss_kpts.item():.6f},{loss_kpts_raw.item():.6f},{loss_kpts_refined.item():.6f},"
+								f"{loss_reliability.item():.6f},{loss_repeatability.item():.6f},"
+								f"{kpt_raw_weight:.4f},{kpt_refined_weight:.4f},"
 								f"{loss_depths.item():.6f},{loss_normals.item():.6f},{loss_gradients.item():.6f},{loss_curvature.item():.6f},"
 								f"{total_pos},{self.opt.param_groups[0]['lr']:.6e},{end-start:.3f}\n")
 
@@ -634,16 +658,18 @@ if __name__ == '__main__':
 		print("Error: MODEL section in config.py is empty. Abort training.")
 		sys.exit(1)
 
-	# Strict guard: when REFINER_TYPE is enabled, all 3D geometric features must be on.
+	# Strict guard: when REFINER_TYPE is enabled, all mainline geometry groups must be on.
+	# Normal is merged into gradients as first-order geometry, so it is not a
+	# standalone required switch here.
 	refiner_type = model_config['refiner_type']
 	if refiner_type != 'None':
 		geo_cfg = model_config.get('geometric_features', {})
-		required_geo = ('depth', 'normal', 'gradients', 'curvatures')
+		required_geo = ('depth', 'gradients', 'curvatures')
 		disabled_geo = [name for name in required_geo if not bool(geo_cfg.get(name, False))]
 		if disabled_geo:
 			print(
-				"Error: REFINER_TYPE is not 'None', but not all geometric features are enabled. "
-				f"Disabled: {disabled_geo}. Please set DEPTH/NORMAL/GRADIENTS/CURVATURES all to True."
+				"Error: REFINER_TYPE is not 'None', but not all mainline geometric features are enabled. "
+				f"Disabled: {disabled_geo}. Please set DEPTH/GRADIENTS/CURVATURES all to True."
 			)
 			sys.exit(1)
 
@@ -661,6 +687,7 @@ if __name__ == '__main__':
 		# Training parameters from CLI args
 		model_name=args.name,
 		ckpt_save_path=args.ckpt_save_path,
+		init_weights=args.init_weights,
 		n_steps=args.n_steps,
 		save_ckpt_every=args.save_ckpt_every,
 		lr=args.lr,

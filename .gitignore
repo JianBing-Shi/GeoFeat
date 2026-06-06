@@ -1,6 +1,8 @@
 # editor settings
 .idea
 .vscode
+.codex
+.stfolder
 
 # datasets file
 datasets/
@@ -10,9 +12,11 @@ data/
 logdir/
 
 # weights file
+weights/*
 weights_0430/*
 weights_0501/*
 weights_0520/*
+weights_0601/*
 
 # onnx models
 *.onnx
@@ -30,8 +34,11 @@ HS-FPN/
 xfeat/
 LoFTR
 
-# old versions
-old/
+# output file	
+output/
 
 # tools file
 tools/
+
+docs/
+legacy/

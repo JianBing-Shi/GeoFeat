@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from model.GeometricExtractor import GeometricComputer
+from model.GeometricExtractor import GeometricExtractor
 
 def dual_softmax_loss(X, Y, temp = 0.2):
 	"""
@@ -141,6 +141,7 @@ class GeoFeatLoss(nn.Module):
 				lam_depth=1,
 				lam_gradients=10,
 				lam_curvature=10,
+				lam_repeatability=0.1,
 				reliability_consistency_weight=0.25,
 				reliability_target_scale=6.0,
 				depth_spvs=True, 
@@ -158,6 +159,7 @@ class GeoFeatLoss(nn.Module):
 		self.lam_depth=lam_depth                  # 深度估计损失权重
 		self.lam_gradients=lam_gradients          # 深度梯度损失权重
 		self.lam_curvature=lam_curvature          # 曲率一致性损失权重
+		self.lam_repeatability=lam_repeatability  # 重复性一致性损失权重
 		self.depth_spvs=depth_spvs                # 是否启用深度监督
 		self.reliability_consistency_weight = float(reliability_consistency_weight)
 		self.reliability_target_scale = float(reliability_target_scale)
@@ -175,6 +177,7 @@ class GeoFeatLoss(nn.Module):
 		self.loss_depths=0          # 深度损失
 		self.loss_gradients=0       # 梯度损失
 		self.loss_curvature=0       # 曲率损失
+		self.loss_repeatability=0   # 重复性一致性损失
 		
 		# 当前批次精度指标
 		self.acc_coarse=0           # 粗匹配精度
@@ -183,7 +186,10 @@ class GeoFeatLoss(nn.Module):
 		
 		# device
 		self.dev=device
-		self.curvature_computer = GeometricComputer().to(device)
+		self.curvature_computer = GeometricExtractor(
+			device=device,
+			enable_depth_extractor=False,
+		).to(device)
 		self.circle_loss = LogCoshCircleLoss(m=0.25, gamma=64).to(device)
 		
 	
@@ -382,6 +388,24 @@ class GeoFeatLoss(nn.Module):
 
 		return torch.cat(loss, dim=-1).mean()
 	
+	def compute_repeatability_loss(self, repeatability1, repeatability2, pts):
+		"""
+		Consistency loss for repeatability maps between paired images.
+		Ensures that the model detects keypoints at the same geometric locations.
+		"""
+		if repeatability1 is None or repeatability2 is None:
+			return torch.tensor(0.0, device=self.dev)
+
+		B = repeatability1.shape[0]
+		loss = []
+		for b in range(B):
+			pts1, pts2 = pts[b][:, :2], pts[b][:, 2:]
+			# Sample repeatability at keypoint locations
+			r1 = repeatability1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()]
+			r2 = repeatability2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()]
+			# Consistency: r1 and r2 should be similar
+			loss.append(F.mse_loss(r1, r2).unsqueeze(0))
+		return torch.cat(loss).mean() if loss else torch.tensor(0.0, device=self.dev)
 	
 	def normal_loss(self,normal,target_normal):
 		"""
@@ -457,12 +481,9 @@ class GeoFeatLoss(nn.Module):
 		if self.geo_config['depth']:
 			geo_dict['depth'] = geo_map[:, geo_idx:geo_idx+1, :, :]
 			geo_idx += 1
-		if self.geo_config['normal']:
-			geo_dict['normal'] = geo_map[:, geo_idx:geo_idx+3, :, :]
-			geo_idx += 3
 		if self.geo_config['gradients']:
-			geo_dict['gradients'] = geo_map[:, geo_idx:geo_idx+2, :, :]
-			geo_idx += 2
+			geo_dict['gradients'] = geo_map[:, geo_idx:geo_idx+5, :, :]
+			geo_idx += 5
 		if self.geo_config['curvatures']:
 			geo_dict['curvatures'] = geo_map[:, geo_idx:geo_idx+1, :, :]
 			geo_idx += 1
@@ -570,27 +591,32 @@ class GeoFeatLoss(nn.Module):
 				if self.geo_config['gradients'] or self.geo_config['curvatures']:
 					# Target features are computed from normalized depth
 					# Since d_target is [0, 1], GeometricExtractor won't divide by 255.
-					feat_target1 = self.curvature_computer(d_target1)
-					feat_target2 = self.curvature_computer(d_target2)
+					feat_target1 = self.curvature_computer(d_target1, return_all=True)
+					feat_target2 = self.curvature_computer(d_target2, return_all=True)
 
 					# Gradients
 					if self.geo_config['gradients']:
-						# Extract predicted gradients (Channel 0: x, Channel 1: y)
+						# Extract predicted first-order geometry:
+						# [grad_x, grad_y, normal_x, normal_y, normal_z].
 						pred_grad1 = cur_geo1['gradients'][b]
 						pred_grad2 = cur_geo2['gradients'][b]
-						
+
 						l_g = self.lam_gradients * (F.l1_loss(pred_grad1[0:1].unsqueeze(0), feat_target1['grad_x']) + \
 									F.l1_loss(pred_grad1[1:2].unsqueeze(0), feat_target1['grad_y']) + \
+									F.l1_loss(pred_grad1[2:5].unsqueeze(0), feat_target1['normal']) + \
 									F.l1_loss(pred_grad2[0:1].unsqueeze(0), feat_target2['grad_x']) + \
-									F.l1_loss(pred_grad2[1:2].unsqueeze(0), feat_target2['grad_y']))
-						# Curvatures
-						if self.geo_config['curvatures']:
-							# Extract predicted curvatures (only mean curvature H1)
-							pred_curv1 = cur_geo1['curvatures'][b]  # shape (1, H, W)
-							pred_curv2 = cur_geo2['curvatures'][b]
+									F.l1_loss(pred_grad2[1:2].unsqueeze(0), feat_target2['grad_y']) + \
+									F.l1_loss(pred_grad2[2:5].unsqueeze(0), feat_target2['normal']))
+						loss_grad_list.append(l_g.unsqueeze(0))
 
-							l_c = self.lam_curvature * (F.l1_loss(pred_curv1.unsqueeze(0), feat_target1['mean_curv']) + F.l1_loss(pred_curv2.unsqueeze(0), feat_target2['mean_curv']))
-							loss_curv_list.append(l_c.unsqueeze(0))
+					# Curvatures
+					if self.geo_config['curvatures']:
+						# Extract predicted curvatures (only mean curvature H1)
+						pred_curv1 = cur_geo1['curvatures'][b]  # shape (1, H, W)
+						pred_curv2 = cur_geo2['curvatures'][b]
+
+						l_c = self.lam_curvature * (F.l1_loss(pred_curv1.unsqueeze(0), feat_target1['mean_curv']) + F.l1_loss(pred_curv2.unsqueeze(0), feat_target2['mean_curv']))
+						loss_curv_list.append(l_c.unsqueeze(0))
 		
 		loss_depth = torch.cat(loss_depth_list).mean() if loss_depth_list else torch.tensor(0.0, device=self.dev)
 		loss_grad = torch.cat(loss_grad_list).mean() if loss_grad_list else torch.tensor(0.0, device=self.dev)
@@ -607,6 +633,7 @@ class GeoFeatLoss(nn.Module):
 				DA_depths1, DA_depths2,
 				megadepth_batch_size,coco_batch_size,
 				reliability1=None, reliability2=None,
+				repeatability1=None, repeatability2=None,
 				raw_kpts1=None, raw_kpts2=None,
 				refined_kpts1=None, refined_kpts2=None,
 				use_dual_kpt_loss=False,
@@ -633,7 +660,12 @@ class GeoFeatLoss(nn.Module):
 			)
 		else:
 			self.loss_reliability = torch.tensor(0.0, device=self.dev)
-		
+
+		if repeatability1 is not None and repeatability2 is not None and self.lam_repeatability > 0:
+			self.loss_repeatability = self.compute_repeatability_loss(repeatability1, repeatability2, pts)
+		else:
+			self.loss_repeatability = torch.tensor(0.0, device=self.dev)
+
 		# keypoint loss: dual-branch (raw+refined) with fallback to single-branch
 		if refined_kpts1 is None:
 			refined_kpts1 = kpts1
@@ -663,19 +695,10 @@ class GeoFeatLoss(nn.Module):
 				raw_w, refined_w = 1.0, 0.0
 				self.loss_kpts = scale * self.loss_kpts_raw
 		
-		# Process geometry features
-		pred_normals1 = geo_features1['normal'] if self.geo_config['normal'] else None
-		pred_normals2 = geo_features2['normal'] if self.geo_config['normal'] else None
+		# Standalone normal supervision has been merged into gradients:
+		# gradients = [dx, dy, normal_x, normal_y, normal_z].
+		self.loss_normals = torch.tensor(0.0, device=self.dev)
 
-		# start=time.perf_counter()
-		if self.geo_config['normal'] and pred_normals1 is not None:
-			self.loss_normals=self.compute_normals_loss(pred_normals1,pred_normals2,DA_normals1,DA_normals2,megadepth_batch_size,coco_batch_size)
-		else:
-			self.loss_normals = torch.tensor(0.0, device=self.dev)
-		# self.loss_normals = self.compute_normals_loss(normals1, normals2, DA_normals1, DA_normals2,coco_batch_size)
-		# end=time.perf_counter()
-		# print(f"normal loss cost {end-start} seconds")
-		
 		if self.lam_depth > 0 or self.lam_gradients > 0 or self.lam_curvature > 0:
 			self.loss_depths, self.loss_gradients, self.loss_curvature = self.compute_geometric_loss(geo_features1, geo_features2, DA_depths1, DA_depths2, megadepth_batch_size)
 		else:
@@ -692,6 +715,7 @@ class GeoFeatLoss(nn.Module):
 			'loss_kpts_raw':self.lam_kpts_raw * self.loss_kpts_raw,
 			'loss_kpts_refined':self.lam_kpts * self.loss_kpts_refined,
 			'loss_reliability': self.lam_reliability * self.loss_reliability,
+			'loss_repeatability': self.lam_repeatability * self.loss_repeatability,
 			'kpt_raw_weight':raw_w,
 			'kpt_refined_weight':refined_w,
 			'acc_kpt':self.acc_kpt,
@@ -701,4 +725,3 @@ class GeoFeatLoss(nn.Module):
 			'loss_gradients': self.lam_gradients * self.loss_gradients,
 			'loss_curvature': self.lam_curvature * self.loss_curvature,
 		}
-
