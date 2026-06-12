@@ -63,10 +63,14 @@ cfg.MODEL.AFT.TEMPERATURE_MAX = 1.60
 cfg.MODEL.AFT.LOCAL_BASE_GAIN = 1.0
 cfg.MODEL.AFT.CORR_BASE_GAIN = 0.5
 
-cfg.MODEL.GEO_CROSS_ATTENTION = CN()
-cfg.MODEL.GEO_CROSS_ATTENTION.ENABLED = True
-cfg.MODEL.GEO_CROSS_ATTENTION.NUM_GROUPS = 4
-cfg.MODEL.GEO_CROSS_ATTENTION.GATE_INIT = -2.0
+# Geometry reliability gate:
+# raw geometry + encoded geometry memory -> reliability-filtered additive geometry.
+cfg.MODEL.GEO_RELIABILITY_GATE = CN()
+cfg.MODEL.GEO_RELIABILITY_GATE.ENABLED = True
+cfg.MODEL.GEO_RELIABILITY_GATE.HIDDEN_DIM = 12
+cfg.MODEL.GEO_RELIABILITY_GATE.GATE_FLOOR = 0.20
+cfg.MODEL.GEO_RELIABILITY_GATE.BIAS_INIT = 2.0
+cfg.MODEL.GEO_RELIABILITY_GATE.FUSION_GAIN = 0.50
 
 # Refiner options: "None", "GCDR"
 cfg.MODEL.REFINER_TYPE = "GCDR"
@@ -83,6 +87,7 @@ cfg.MODEL.GCDR.GATE_FLOOR = 0.10
 cfg.MODEL.GCDR.RESIDUAL_GAIN = 1.0
 # residual gate 的最小保留比例，保证残差路径不会被完全关闭。
 cfg.MODEL.GCDR.RESIDUAL_GATE_FLOOR = 0.10
+cfg.MODEL.GCDR.RESIDUAL_CLIP = 0.25
 
 cfg.LOSS = CN()
 # reliability supervision 的总权重；为 0 时表示不显式监督可靠性图。
@@ -93,6 +98,17 @@ cfg.LOSS.RELIABILITY_CONSISTENCY_WEIGHT = 0.25
 cfg.LOSS.RELIABILITY_TARGET_SCALE = 6.0
 # 重复性一致性损失权重，约束配对图像间的关键点检测稳定性。
 cfg.LOSS.REPEATABILITY_LOSS_WEIGHT = 0.0
+cfg.LOSS.DEPTH_WEIGHT = 1.0
+cfg.LOSS.GRADIENT_WEIGHT = 2.0
+cfg.LOSS.CURVATURE_WEIGHT = 1.0
+cfg.LOSS.DESCRIPTOR_PROTECT_WEIGHT = 0.10
+cfg.LOSS.RELIABLE_ENHANCE_MARGIN = 0.02
+cfg.LOSS.RELIABLE_ENHANCE_WEIGHT = 0.05
+cfg.LOSS.RELIABLE_ENHANCE_THRESHOLD = 0.50
+cfg.LOSS.RELIABLE_ENHANCE_QUANTILE = 0.50
+cfg.LOSS.UNRELIABLE_SUPPRESS_WEIGHT = 0.05
+cfg.LOSS.UNRELIABLE_SUPPRESS_THRESHOLD = 0.45
+cfg.LOSS.UNRELIABLE_SUPPRESS_QUANTILE = 0.25
 # 重复性图的权重系数，控制其对关键点预测的影响程度
 # ALPHA小：更依赖原始关键点预测；
 # ALPHA大：更依赖重复性图进行调整
@@ -125,6 +141,17 @@ def get_loss_config(cfg_node=None):
 		'reliability_consistency_weight': float(active_cfg.LOSS.RELIABILITY_CONSISTENCY_WEIGHT),
 		'reliability_target_scale': float(active_cfg.LOSS.RELIABILITY_TARGET_SCALE),
 		'repeatability_loss_weight': float(active_cfg.LOSS.REPEATABILITY_LOSS_WEIGHT),
+		'depth_weight': float(active_cfg.LOSS.DEPTH_WEIGHT),
+		'gradient_weight': float(active_cfg.LOSS.GRADIENT_WEIGHT),
+		'curvature_weight': float(active_cfg.LOSS.CURVATURE_WEIGHT),
+		'descriptor_protect_weight': float(active_cfg.LOSS.DESCRIPTOR_PROTECT_WEIGHT),
+		'reliable_enhance_margin': float(active_cfg.LOSS.RELIABLE_ENHANCE_MARGIN),
+		'reliable_enhance_weight': float(active_cfg.LOSS.RELIABLE_ENHANCE_WEIGHT),
+		'reliable_enhance_threshold': float(active_cfg.LOSS.RELIABLE_ENHANCE_THRESHOLD),
+		'reliable_enhance_quantile': float(active_cfg.LOSS.RELIABLE_ENHANCE_QUANTILE),
+		'unreliable_suppress_weight': float(active_cfg.LOSS.UNRELIABLE_SUPPRESS_WEIGHT),
+		'unreliable_suppress_threshold': float(active_cfg.LOSS.UNRELIABLE_SUPPRESS_THRESHOLD),
+		'unreliable_suppress_quantile': float(active_cfg.LOSS.UNRELIABLE_SUPPRESS_QUANTILE),
 	}
 
 
@@ -163,10 +190,12 @@ def get_model_config(cfg_node=None):
 			'local_base_gain': float(active_cfg.MODEL.AFT.LOCAL_BASE_GAIN),
 			'corr_base_gain': float(active_cfg.MODEL.AFT.CORR_BASE_GAIN),
 		},
-		'geo_cross_attention': {
-			'enabled': bool(active_cfg.MODEL.GEO_CROSS_ATTENTION.ENABLED),
-			'num_groups': int(active_cfg.MODEL.GEO_CROSS_ATTENTION.NUM_GROUPS),
-			'gate_init': float(active_cfg.MODEL.GEO_CROSS_ATTENTION.GATE_INIT),
+		'geo_reliability_gate': {
+			'enabled': bool(active_cfg.MODEL.GEO_RELIABILITY_GATE.ENABLED),
+			'hidden_dim': int(active_cfg.MODEL.GEO_RELIABILITY_GATE.HIDDEN_DIM),
+			'gate_floor': float(active_cfg.MODEL.GEO_RELIABILITY_GATE.GATE_FLOOR),
+			'bias_init': float(active_cfg.MODEL.GEO_RELIABILITY_GATE.BIAS_INIT),
+			'fusion_gain': float(active_cfg.MODEL.GEO_RELIABILITY_GATE.FUSION_GAIN),
 		},
 		'refiner_type': str(active_cfg.MODEL.REFINER_TYPE),
 		'gcdr_config': {
@@ -175,6 +204,7 @@ def get_model_config(cfg_node=None):
 			'gate_floor': float(active_cfg.MODEL.GCDR.GATE_FLOOR),
 			'residual_gain': float(active_cfg.MODEL.GCDR.RESIDUAL_GAIN),
 			'residual_gate_floor': float(active_cfg.MODEL.GCDR.RESIDUAL_GATE_FLOOR),
+			'residual_clip': float(active_cfg.MODEL.GCDR.RESIDUAL_CLIP),
 		},
 		'loss_config': get_loss_config(active_cfg),
 		'last_activation': str(active_cfg.MODEL.LAST_ACTIVATION),

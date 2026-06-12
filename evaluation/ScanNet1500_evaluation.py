@@ -3,7 +3,7 @@
 	https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
 
     Camera pose metrics adapted from LoFTR https://github.com/zju3dv/LoFTR/blob/master/src/utils/metrics.py
-    The main difference is the use of poselib instead of OpenCV's vanilla RANSAC for E_mat, which is more stable and MUCH and faster.
+    ScanNet pose estimation is fixed to PoseLib relative pose RANSAC.
 
 """
 
@@ -15,6 +15,8 @@ import cv2
 from tqdm import tqdm
 import json
 import multiprocessing as mp
+
+POSE_ESTIMATOR = 'poselib'
 
 # Ensure local imports work when running this file directly from the repo root.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -60,50 +62,24 @@ def compute_pose_error(T_0to1, R, t):
     error_R = angle_error_mat(R, R_gt)
     return error_t, error_R
 
-def estimate_pose(kpts0, kpts1, K0, K1, thresh, conf=0.99999, type='poselib'):
+def estimate_pose(kpts0, kpts1, K0, K1, thresh, conf=0.99999):
     if len(kpts0) < 5:
         return None
-    if type == 'poselib':
-        import poselib
-        (pose,details) = poselib.estimate_relative_pose(
-            kpts0.tolist(), 
-            kpts1.tolist(),
-            intrinsics_to_camera(K0),
-            intrinsics_to_camera(K1),
-            ransac_opt={
-                'max_iterations': 10000, # default 100000
-                'success_prob': conf, # default 0.99999
-                'max_epipolar_error': thresh, # default 1.0
-            },
-            bundle_opt={  # all defaults
-                },
-            )
-        ret = (pose.R, pose.t, details['inliers'])
-
-    elif type == 'opencv':
-        f_mean = np.mean([K0[0, 0], K1[1, 1], K0[0, 0], K1[1, 1]])
-        norm_thresh = thresh / f_mean
-
-        kpts0 = (kpts0 - K0[[0, 1], [2, 2]][None]) / K0[[0, 1], [0, 1]][None]
-        kpts1 = (kpts1 - K1[[0, 1], [2, 2]][None]) / K1[[0, 1], [0, 1]][None]
-
-        E, mask = cv2.findEssentialMat(
-            kpts0, kpts1, np.eye(3), threshold=norm_thresh, prob=conf,
-            method=cv2.RANSAC)
-
-        assert E is not None
-
-        best_num_inliers = 0
-        ret = None
-        for _E in np.split(E, len(E) / 3):
-            n, R, t, _ = cv2.recoverPose(
-                _E, kpts0, kpts1, np.eye(3), 1e9, mask=mask)
-            if n > best_num_inliers:
-                best_num_inliers = n
-                ret = (R, t[:, 0], mask.ravel() > 0)
-    else:
-        raise NotImplementedError
-
+    import poselib
+    pose, details = poselib.estimate_relative_pose(
+        kpts0.tolist(),
+        kpts1.tolist(),
+        intrinsics_to_camera(K0),
+        intrinsics_to_camera(K1),
+        ransac_opt={
+            'max_iterations': 10000, # default 100000
+            'success_prob': conf, # default 0.99999
+            'max_epipolar_error': thresh, # default 1.0
+        },
+        bundle_opt={  # all defaults
+        },
+    )
+    ret = (pose.R, pose.t, details['inliers'])
     return ret
 
 def estimate_pose_parallel(args):
@@ -145,7 +121,7 @@ class Scannet1500:
         'scannet_path': os.path.abspath(os.path.join(os.path.dirname(__file__), '../data')),
         # ScanNet1500 ground-truth file stored alongside the dataset root.
         'gt_path': os.path.abspath(os.path.join(os.path.dirname(__file__), '../data/scannet_1500.npz')),
-        'pose_estimator': 'poselib', # poselib, opencv
+        'pose_estimator': POSE_ESTIMATOR,
         'cache_images': True,
         'ransac_thresholds': [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
         'pose_thresholds': [5, 10, 20],
@@ -256,7 +232,7 @@ class Scannet1500:
         accs_by_thresh = {}
         for ransac_thresh in self.config['ransac_thresholds']:
 
-            fname = os.path.join(self.config['output'], f'{name}_{self.config["pose_estimator"]}_{ransac_thresh}.txt')
+            fname = os.path.join(self.config['output'], f'{name}_{POSE_ESTIMATOR}_{ransac_thresh}.txt')
             # check if exists and has the right number of lines
             if not force and os.path.exists(fname) and len(open(fname, 'r').readlines()) == len(self.pairs):
                 errors = []
@@ -323,7 +299,7 @@ class Scannet1500:
                 'aucs_by_thresh': aucs_by_thresh,
                 'accs_by_thresh': accs_by_thresh,
             }
-            json.dump(summary, open(os.path.join(self.config['output'], f'{name}_{self.config["pose_estimator"]}_summary.json'), 'w'), indent=2)
+            json.dump(summary, open(os.path.join(self.config['output'], f'{name}_{POSE_ESTIMATOR}_summary.json'), 'w'), indent=2)
 
         return aucs_by_thresh
 
@@ -377,14 +353,13 @@ def parse():
     
     # Default to the repo-local dataset layout so the command can be short.
     parser.add_argument("--scannet_path", type=str, default='./data', help="Path to the ScanNet root containing scannet_test_1500")
-    parser.add_argument("--output", type=str, default="./output/scannet/", help="Path to the output directory")
+    parser.add_argument("--output", type=str, default="./output/xfeat/", help="Path to the output directory")
     parser.add_argument("--max_pairs", type=int, default=-1, help="Maximum number of pairs to run the benchmark on")
     parser.add_argument("--force", action='store_true', help="Force running the benchmark again")
-    parser.add_argument("--pose_estimator", type=str, default='poselib', help="Which pose estimator to use: poselib, opencv", choices=['poselib', 'opencv'])
     # XFeat weights are now configurable from the CLI.
     parser.add_argument("--weights", type=str, default='./weights/xfeat.pt', help="Path to model checkpoint")
     # Default to xfeat so the benchmark does not require optional ALIKE deps.
-    parser.add_argument("--method", type=str, default='xfeat', choices=['xfeat', 'xfeat_star', 'liftfeat', 'geofeat', 'alike', 'all'], help="Which matcher to evaluate")
+    parser.add_argument("--method", type=str, default='geofeat', choices=['xfeat', 'xfeat_star', 'liftfeat', 'geofeat', 'alike', 'all'], help="Which matcher to evaluate")
     parser.add_argument("--descriptor_source", type=str, default='refined', choices=['raw', 'refined'], help="GeoFeat descriptor source")
     parser.add_argument("--keypoint_source", type=str, default='refined', choices=['raw', 'refined'], help="GeoFeat keypoint source")
     parser.add_argument("--descriptor_confidence_gain", type=float, default=0.0, help="GeoFeat adaptive descriptor fusion strength [0,+inf), 0 disables")
@@ -406,7 +381,7 @@ if __name__ == "__main__":
             'cache_images': False,
             'output': args.output,
             'max_pairs': args.max_pairs,
-            'pose_estimator': args.pose_estimator,
+            'pose_estimator': POSE_ESTIMATOR,
             'ransac_thresholds': [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
             'n_workers': 8,
         })
@@ -414,25 +389,8 @@ if __name__ == "__main__":
         if args.max_pairs > 0:
             scannet.pairs = scannet.pairs[:args.max_pairs]
 
-        if args.method == 'all':
-            # Preserve the original multi-method benchmark when explicitly requested.
-            functions = {
-                'xfeat': get_xfeat(weights=args.weights),
-                'xfeat_star': get_xfeat_star(),
-                'liftfeat': get_liftfeat(weights=args.weights),
-                'geofeat': get_geofeat(
-                    weights=args.weights,
-                    descriptor_source=args.descriptor_source,
-                    keypoint_source=args.keypoint_source,
-                    descriptor_confidence_gain=args.descriptor_confidence_gain,
-                    repeatability_adaptive_gamma=args.repeatability_adaptive_gamma,
-                ),
-                'alike': get_alike(),
-            }
-        elif args.method == 'xfeat':
+        if args.method == 'xfeat':
             functions = {'xfeat': get_xfeat(weights=args.weights)}
-        elif args.method == 'xfeat_star':
-            functions = {'xfeat_star': get_xfeat_star()}
         elif args.method == 'liftfeat':
             functions = {'liftfeat': get_liftfeat(weights=args.weights)}
         elif args.method == 'geofeat':
@@ -446,7 +404,7 @@ if __name__ == "__main__":
                 )
             }
         else:
-            functions = {'alike': get_alike()}
+            functions = {'xfeat_star': get_xfeat_star()}
 
         # save all results to a file
         all_results = {}
@@ -479,9 +437,7 @@ if __name__ == "__main__":
                 continue
             aucs_by_thresh = summary_data[metric_key]
 
-            estimator = 'poselib'
-            if 'opencv' in summary:
-                estimator = 'opencv'
+            estimator = POSE_ESTIMATOR
 
             #make sure everything is float
             for thresh in aucs_by_thresh:

@@ -1,7 +1,5 @@
-# GeoFeat 0.936M Balanced Single-GPU Training
-# Goal: use one config for the sub-1M mainline on a single available GPU.
-# The reliability/repeatability losses are kept mild so the model can train
-# stably without a separate warmup/finetune config.
+# GeoFeat reliability-gated geometry path with GCDR.
+# Geometry enters through branch encoding, reliability gating, GCDR, and AFT.
 
 DATASET:
   USE_MEGADEPTH: true
@@ -42,23 +40,41 @@ MODEL:
     LOCAL_BASE_GAIN: 1.0
     CORR_BASE_GAIN: 0.5
 
-  GEO_CROSS_ATTENTION:
+  GEO_RELIABILITY_GATE:
     ENABLED: true
-    NUM_GROUPS: 4
-    GATE_INIT: -2.0
+    HIDDEN_DIM: 12
+    GATE_FLOOR: 0.20
+    BIAS_INIT: 2.0
+    FUSION_GAIN: 0.50
 
   GCDR:
     GEO_COMPRESS: 12
     RELIABILITY_HIDDEN: 12
     GATE_FLOOR: 0.10
-    RESIDUAL_GAIN: 0.60
-    RESIDUAL_GATE_FLOOR: 0.10
+    RESIDUAL_GAIN: 0.35
+    RESIDUAL_GATE_FLOOR: 0.05
+    RESIDUAL_CLIP: 0.20
 
 LOSS:
+  # DAM depth -> GeometricExtractor targets:
+  # depth=0D, gradients=1D [dx,dy,nx,ny,nz], curvatures=2D mean_curv.
+  # Conservative mainline keeps geometry supervision from dominating descriptor learning.
+  DEPTH_WEIGHT: 1.0
+  GRADIENT_WEIGHT: 2.0
+  CURVATURE_WEIGHT: 1.0
+
   RELIABILITY_LOSS_WEIGHT: 0.25
   RELIABILITY_CONSISTENCY_WEIGHT: 0.25
   RELIABILITY_TARGET_SCALE: 6.0
   REPEATABILITY_LOSS_WEIGHT: 0.03
+  DESCRIPTOR_PROTECT_WEIGHT: 0.10
+  RELIABLE_ENHANCE_MARGIN: 0.02
+  RELIABLE_ENHANCE_WEIGHT: 0.05
+  RELIABLE_ENHANCE_THRESHOLD: 0.50
+  RELIABLE_ENHANCE_QUANTILE: 0.50
+  UNRELIABLE_SUPPRESS_WEIGHT: 0.10
+  UNRELIABLE_SUPPRESS_THRESHOLD: 0.45
+  UNRELIABLE_SUPPRESS_QUANTILE: 0.25
 
 TRAIN:
   USE_DUAL_KPT_LOSS: true

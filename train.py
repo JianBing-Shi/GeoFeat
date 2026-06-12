@@ -82,6 +82,7 @@ import sys
 import os
 
 from model.GeoFeatModel import GeoFeatModel
+from model.GeometricExtractor import GeometricExtractor
 from loss.loss import GeoFeatLoss
 # from model.interpolator import InterpolateSparse2d
 from utils.depth_anything_wrapper import DepthAnythingExtractor
@@ -168,12 +169,23 @@ class Trainer():
 		self.loss_fn = GeoFeatLoss(
 			self.dev, 
 			lam_descs=1, 
-			lam_fb_descs=2,       # 保持描述子权重
+			lam_fb_descs=3,       # 保持描述子权重
 			lam_kpts=2, 
-			lam_kpts_raw=2,
+			lam_kpts_raw=5,
 			lam_heatmap=1,
 			lam_reliability=reliability_loss_weight,
 			lam_repeatability=repeatability_loss_weight,
+			lam_depth=float(loss_cfg.get('depth_weight', 1.0)),
+			lam_gradients=float(loss_cfg.get('gradient_weight', 2.0)),
+			lam_curvature=float(loss_cfg.get('curvature_weight', 1.0)),
+			lam_descriptor_protect=float(loss_cfg.get('descriptor_protect_weight', 0.0)),
+			lam_reliable_enhance=float(loss_cfg.get('reliable_enhance_weight', 0.0)),
+			lam_unreliable_suppress=float(loss_cfg.get('unreliable_suppress_weight', 0.0)),
+			reliable_enhance_margin=float(loss_cfg.get('reliable_enhance_margin', 0.02)),
+			reliable_enhance_threshold=float(loss_cfg.get('reliable_enhance_threshold', 0.60)),
+			reliable_enhance_quantile=float(loss_cfg.get('reliable_enhance_quantile', 0.50)),
+			unreliable_suppress_threshold=float(loss_cfg.get('unreliable_suppress_threshold', 0.45)),
+			unreliable_suppress_quantile=float(loss_cfg.get('unreliable_suppress_quantile', 0.25)),
 			reliability_consistency_weight=float(loss_cfg.get('reliability_consistency_weight', 0.25)),
 			reliability_target_scale=float(loss_cfg.get('reliability_target_scale', 6.0)),
 			geo_config=geo_config
@@ -181,7 +193,11 @@ class Trainer():
 
 		# depth-anything model  # 深度估计提取器
 		self.depth_net = DepthAnythingExtractor('vits', self.dev, 256)
-		# self.depth_net = self.net.geometric_extractor.depth_extractor
+		self.dam_geometry_extractor = GeometricExtractor(
+			model_config=self.model_config,
+			device=self.dev,
+			enable_depth_extractor=False,
+		).to(self.dev).eval()
 
 		# alike model   # 高效的高精度局部特征提取模型
 		self.alike_net = ALikeExtractor('alike-t', self.dev)
@@ -303,8 +319,9 @@ class Trainer():
 				f.write('global_step,loss,' \
 						'loss_descs,acc_coarse,' \
 						'loss_fb_descs,acc_fb_coarse,' \
-						'loss_kpts,loss_kpts_raw,loss_kpts_refined,loss_reliability,loss_repeatability,kpt_raw_weight,kpt_refined_weight,' \
-						'loss_depths,loss_normals,loss_gradients,loss_curvature,' \
+						'loss_kpts,loss_kpts_raw,loss_kpts_refined,loss_reliability,loss_repeatability,loss_descriptor_protect,loss_reliable_enhance,loss_unreliable_suppress,' \
+						'reliable_enhance_rate,reliable_region_ratio,reliable_mean_gain,unreliable_enhance_rate,unreliable_region_ratio,unreliable_mean_gain,kpt_raw_weight,kpt_refined_weight,' \
+						'loss_depths,loss_gradients,loss_curvature,' \
 						'total_pos,lr,forward_cost\n')
 			print(f"Status file initialized: {self.status_path}")
 		except Exception as e:
@@ -432,12 +449,12 @@ class Trainer():
 				
 				# 初始描述子特征匹配, 增强描述子匹配
 				alike_kpts1, alike_kpts2 = [], []
-				DA_normals1, DA_normals2 = [], []
-				DA_depths1, DA_depths2 = [], []
+				DA_normals1, DA_normals2 = [], []  # Legacy loss arguments; normals are packed into gradients.
+				DA_geo_targets1, DA_geo_targets2 = [], []
 
 				# import pdb;pdb.set_trace()
 
-				fb_feats1,fb_feats2=[],[]
+				fb_feats1, fb_feats2=[],[]
 				geo_reliability1, geo_reliability2 = [], []
 				repeatability1, repeatability2 = [], []
 				kpt_maps1_refined, kpt_maps2_refined = [], []
@@ -482,10 +499,10 @@ class Trainer():
 				
 				# import pdb;pdb.set_trace()
 				for b in range(len(imgs1_np)):
-					megadepth_depth1, megadepth_norm1, _, _ = self.depth_net.extract(imgs1_np[b])
-					megadepth_depth2, megadepth_norm2, _, _ = self.depth_net.extract(imgs2_np[b])
-					DA_normals1.append(megadepth_norm1);DA_normals2.append(megadepth_norm2)
-					DA_depths1.append(megadepth_depth1);DA_depths2.append(megadepth_depth2)
+					geo_target1 = self.depth_net.extract(imgs1_np[b], geometric_extractor=self.dam_geometry_extractor,)
+					geo_target2 = self.depth_net.extract(imgs2_np[b], geometric_extractor=self.dam_geometry_extractor,)
+					DA_geo_targets1.append(geo_target1)
+					DA_geo_targets2.append(geo_target2)
 					
 				# import pdb;pdb.set_trace()
 				fb_feats1=torch.cat(fb_feats1,dim=0)
@@ -512,7 +529,7 @@ class Trainer():
 					positives_coarse,                                         	# 粗糙匹配点
 					alike_kpts1, alike_kpts2,                                  	# ALIKE关键点
 					DA_normals1, DA_normals2,                                  	# MegaDepth法向量
-					DA_depths1, DA_depths2,                                    	# MegaDepth深度
+					DA_geo_targets1, DA_geo_targets2,                           	# DAM depth -> GeometricExtractor targets
 					self.megadepth_batch_size, self.coco_batch_size,
 					reliability1=geo_reliability1,
 					reliability2=geo_reliability2,
@@ -538,12 +555,20 @@ class Trainer():
 				loss_kpts_refined = loss_info.get('loss_kpts_refined', torch.tensor(0.0, device=self.dev))
 				loss_reliability = loss_info.get('loss_reliability', torch.tensor(0.0, device=self.dev))
 				loss_repeatability = loss_info.get('loss_repeatability', torch.tensor(0.0, device=self.dev))
+				loss_descriptor_protect = loss_info.get('loss_descriptor_protect', torch.tensor(0.0, device=self.dev))
+				loss_reliable_enhance = loss_info.get('loss_reliable_enhance', torch.tensor(0.0, device=self.dev))
+				loss_unreliable_suppress = loss_info.get('loss_unreliable_suppress', torch.tensor(0.0, device=self.dev))
+				reliable_enhance_rate = loss_info.get('reliable_enhance_rate', torch.tensor(0.0, device=self.dev))
+				reliable_region_ratio = loss_info.get('reliable_region_ratio', torch.tensor(0.0, device=self.dev))
+				reliable_mean_gain = loss_info.get('reliable_mean_gain', torch.tensor(0.0, device=self.dev))
+				unreliable_enhance_rate = loss_info.get('unreliable_enhance_rate', torch.tensor(0.0, device=self.dev))
+				unreliable_region_ratio = loss_info.get('unreliable_region_ratio', torch.tensor(0.0, device=self.dev))
+				unreliable_mean_gain = loss_info.get('unreliable_mean_gain', torch.tensor(0.0, device=self.dev))
 				kpt_raw_weight = float(loss_info.get('kpt_raw_weight', kpt_raw_weight))
 				kpt_refined_weight = float(loss_info.get('kpt_refined_weight', kpt_refined_weight))
 				acc_kpt = loss_info['acc_kpt']
 
 				loss_depths = loss_info['loss_depths']
-				loss_normals = loss_info['loss_normals']
 				loss_gradients = loss_info['loss_gradients']
 				loss_curvature = loss_info['loss_curvature']
 				
@@ -552,8 +577,11 @@ class Trainer():
 				loss_items.append(loss_kpts.unsqueeze(0))       # 关键点损失
 				if self.model_config.get('refiner_type') == 'GCDR':
 					loss_items.append(loss_reliability.unsqueeze(0))
+					loss_items.append(loss_reliable_enhance.unsqueeze(0))
+					loss_items.append(loss_unreliable_suppress.unsqueeze(0))
 				
 				loss_items.append(loss_repeatability.unsqueeze(0))
+				loss_items.append(loss_descriptor_protect.unsqueeze(0))
 
 				# Add geometric losses if enabled
 				geo_config = self.model_config['geometric_features']
@@ -604,10 +632,18 @@ class Trainer():
 				self.writer.add_scalar('Loss/kpts_refined', loss_kpts_refined.item(), global_step)
 				self.writer.add_scalar('Loss/reliability', loss_reliability.item(), global_step)
 				self.writer.add_scalar('Loss/repeatability', loss_repeatability.item(), global_step)
+				self.writer.add_scalar('Loss/descriptor_protect', loss_descriptor_protect.item(), global_step)
+				self.writer.add_scalar('Loss/reliable_enhance', loss_reliable_enhance.item(), global_step)
+				self.writer.add_scalar('Loss/unreliable_suppress', loss_unreliable_suppress.item(), global_step)
+				self.writer.add_scalar('Reliability/enhance_rate', reliable_enhance_rate.item(), global_step)
+				self.writer.add_scalar('Reliability/reliable_region_ratio', reliable_region_ratio.item(), global_step)
+				self.writer.add_scalar('Reliability/reliable_mean_gain', reliable_mean_gain.item(), global_step)
+				self.writer.add_scalar('Reliability/unreliable_enhance_rate', unreliable_enhance_rate.item(), global_step)
+				self.writer.add_scalar('Reliability/unreliable_region_ratio', unreliable_region_ratio.item(), global_step)
+				self.writer.add_scalar('Reliability/unreliable_mean_gain', unreliable_mean_gain.item(), global_step)
 				self.writer.add_scalar('Loss/kpt_raw_weight', kpt_raw_weight, global_step)
 				self.writer.add_scalar('Loss/kpt_refined_weight', kpt_refined_weight, global_step)
 				self.writer.add_scalar('Loss/depths', loss_depths.item(), global_step)
-				self.writer.add_scalar('Loss/normals', loss_normals.item(), global_step)
 				self.writer.add_scalar('Loss/gradients', loss_gradients.item(), global_step)
 				self.writer.add_scalar('Loss/curvature', loss_curvature.item(), global_step)
 				
@@ -620,8 +656,11 @@ class Trainer():
 								f"{loss_fb_descs.item():.6f},{acc_fb_coarse:.4f},"
 								f"{loss_kpts.item():.6f},{loss_kpts_raw.item():.6f},{loss_kpts_refined.item():.6f},"
 								f"{loss_reliability.item():.6f},{loss_repeatability.item():.6f},"
+								f"{loss_descriptor_protect.item():.6f},{loss_reliable_enhance.item():.6f},{loss_unreliable_suppress.item():.6f},"
+								f"{reliable_enhance_rate.item():.6f},{reliable_region_ratio.item():.6f},{reliable_mean_gain.item():.6f},"
+								f"{unreliable_enhance_rate.item():.6f},{unreliable_region_ratio.item():.6f},{unreliable_mean_gain.item():.6f},"
 								f"{kpt_raw_weight:.4f},{kpt_refined_weight:.4f},"
-								f"{loss_depths.item():.6f},{loss_normals.item():.6f},{loss_gradients.item():.6f},{loss_curvature.item():.6f},"
+								f"{loss_depths.item():.6f},{loss_gradients.item():.6f},{loss_curvature.item():.6f},"
 								f"{total_pos},{self.opt.param_groups[0]['lr']:.6e},{end-start:.3f}\n")
 
 

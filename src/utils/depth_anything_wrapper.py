@@ -320,17 +320,14 @@ class DepthAnythingExtractor(nn.Module):
     
     # 深度提取
     @torch.inference_mode()
-    def extract(self, img, target_size=None):
+    def extract_depth(self, img, target_size=None):
         """
-        Extract depth and normal from a single image.
+        Extract only the DAM depth map from a single image.
         Args:
             img: numpy array (H, W, 3) BGR
             target_size: tuple (H, W) for output size. If None, uses self.process_size
         Returns:
             depth_t: (H, W) tensor
-            normal_map: (H, W, 3) tensor
-            gradient_map: (H, W, 2) tensor
-            curvature_map: (H, W, 5) tensor
         """
         # DA3 inference expects RGB images (numpy, PIL, or path)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -367,16 +364,30 @@ class DepthAnythingExtractor(nn.Module):
         # 深度图归一化, 将深度值线性映射到 [0, 255] 范围
         if depth_t.max() - depth_t.min() > 1e-6:
             depth_t = (depth_t - depth_t.min()) / (depth_t.max() - depth_t.min()) * 255.0
-        
-        # 法向量计算
-        normal_map = self.compute_normal_map_torch(depth_t, 1.0)
 
-        # 向量梯度计算
-        gradient_map = self.compute_gradient_map_torch(depth_t, 1.0, normalize=True)
-        # 曲率计算
-        curvature_map = self.compute_curvature_map_torch(depth_t, 1.0, normalize=True)
+        return depth_t
 
-        return depth_t, normal_map, gradient_map, curvature_map
+    @torch.inference_mode()
+    def extract(self, img, target_size=None, geometric_extractor=None):
+        """Extract compact 3D geometry from DAM depth.
+
+        DAM outputs depth only. GeometricExtractor then computes:
+        depth: 1 channel
+        gradients: 5 channels [dx, dy, normal_x, normal_y, normal_z]
+        curvatures: 1 channel mean curvature
+        """
+        depth_t = self.extract_depth(img, target_size=target_size)
+        depth_bchw = depth_t.unsqueeze(0).unsqueeze(0)
+
+        if geometric_extractor is None:
+            from src.model.GeometricExtractor import GeometricExtractor
+            geometric_extractor = GeometricExtractor(
+                device=depth_t.device,
+                enable_depth_extractor=False,
+            ).to(depth_t.device)
+
+        geo = geometric_extractor(depth=depth_bchw, return_all=False)
+        return {name: value.detach() for name, value in geo.items()}
     
     
 if __name__=="__main__":
@@ -393,15 +404,18 @@ if __name__=="__main__":
             return ((arr - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
         
         DAExtractor=DepthAnythingExtractor('vits',torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),256)
-        depth_t, norm, grad, curv = DAExtractor.extract(img)
+        geo = DAExtractor.extract(img)
+        depth_t = geo["depth"]
+        grad = geo["gradients"]
+        curv = geo["curvatures"]
         
-        norm=norm.cpu().numpy()
+        norm=grad[0, 2:5].permute(1, 2, 0).cpu().numpy()
         norm=(norm+1)/2*255
         norm=norm.astype(np.uint8)
         cv2.imwrite(os.path.join(os.path.dirname(__file__),"norm.png"),norm)
 
         # 梯度图可视化: 2通道(dx, dy) + 幅值
-        grad_np = grad.detach().cpu().numpy()
+        grad_np = grad[0, 0:2].permute(1, 2, 0).detach().cpu().numpy()
         grad_x_u8 = to_uint8_map(grad_np[:, :, 0])
         grad_y_u8 = to_uint8_map(grad_np[:, :, 1])
         grad_mag_u8 = to_uint8_map(np.sqrt(grad_np[:, :, 0] ** 2 + grad_np[:, :, 1] ** 2))
@@ -412,16 +426,13 @@ if __name__=="__main__":
         cv2.imwrite(os.path.join(os.path.dirname(__file__),"grad_mag.png"),grad_mag_u8)
 
         # 曲率图可视化: 5通道(k1, k2, K, H, SI)
-        curv_np = curv.detach().cpu().numpy()
-        curv_names = ["k1", "k2", "K", "H", "SI"]
-        for i, name in enumerate(curv_names):
-            curv_u8 = to_uint8_map(curv_np[:, :, i])
-            cv2.imwrite(os.path.join(os.path.dirname(__file__),f"curv_{name}.png"),curv_u8)
+        curv_np = curv[0, 0].detach().cpu().numpy()
+        cv2.imwrite(os.path.join(os.path.dirname(__file__),"curv_mean.png"),to_uint8_map(curv_np))
 
         
         start=time.perf_counter()
         for i in range(20):
-            depth_t, norm, grad, curv = DAExtractor.extract(img)
+            geo = DAExtractor.extract(img)
         end=time.perf_counter()
         print(f"cost {end-start} seconds")
     else:

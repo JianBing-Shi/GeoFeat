@@ -93,10 +93,12 @@ def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
 			"local_base_gain": 1.0,
 			"corr_base_gain": 0.5,
 		},
-		"geo_cross_attention": {
-			"enabled": True,
-			"num_groups": 4,
-			"gate_init": -2.0,
+		"geo_reliability_gate": {
+			"enabled": False,
+			"hidden_dim": 12,
+			"gate_floor": 0.20,
+			"bias_init": 2.0,
+			"fusion_gain": 0.50,
 		},
 	}
 	for key, value in fallbacks.items():
@@ -111,6 +113,28 @@ def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
 			print("Warning: merged legacy standalone normal geometry into 'gradients'.")
 		geo_cfg["normal"] = False
 		cfg["geometric_features"] = geo_cfg
+	gate_cfg = cfg.get("geo_reliability_gate")
+	if isinstance(gate_cfg, dict):
+		gate_cfg = dict(gate_cfg)
+		gate_cfg.setdefault("fusion_gain", 0.50)
+		cfg["geo_reliability_gate"] = gate_cfg
+	gcdr_cfg = cfg.get("gcdr_config")
+	if isinstance(gcdr_cfg, dict):
+		gcdr_cfg = dict(gcdr_cfg)
+		gcdr_cfg.setdefault("residual_clip", 0.25)
+		cfg["gcdr_config"] = gcdr_cfg
+	loss_cfg = cfg.get("loss_config")
+	if isinstance(loss_cfg, dict):
+		loss_cfg = dict(loss_cfg)
+		loss_cfg.setdefault("descriptor_protect_weight", 0.0)
+		loss_cfg.setdefault("reliable_enhance_margin", 0.02)
+		loss_cfg.setdefault("reliable_enhance_weight", 0.0)
+		loss_cfg.setdefault("reliable_enhance_threshold", 0.60)
+		loss_cfg.setdefault("reliable_enhance_quantile", 0.50)
+		loss_cfg.setdefault("unreliable_suppress_weight", 0.0)
+		loss_cfg.setdefault("unreliable_suppress_threshold", 0.45)
+		loss_cfg.setdefault("unreliable_suppress_quantile", 0.25)
+		cfg["loss_config"] = loss_cfg
 	return cfg
 
 

@@ -525,66 +525,77 @@ class GeometricEncoder(nn.Module):
 			return self.dropout(self.encoder(x))
 		return self.encoder(x)
 
-# 负责 2D descriptor 主动读取 3D geometry
-class GroupedLinearGeoCrossAttention(nn.Module):
-	"""Linear cross-attention from descriptor queries to geometry memory.
+# Reliability gate for encoded geometry before additive descriptor fusion.
+class GeometryReliabilityGate(nn.Module):
+	"""Reliability filter for encoded geometry before descriptor fusion.
 
-	Descriptors provide Q; encoded geometry provides K/V. The attention is grouped
-	and linear over spatial tokens, matching the cost profile of AFT instead of
-	full O(N^2) cross-attention.
+	The gate looks at both raw geometry and encoded geometry memory. It predicts
+	a spatial reliability map and suppresses unreliable geometry before it is
+	added to the descriptor stream.
 	"""
 
 	def __init__(
 		self,
-		d_model: int,
-		num_groups: int = 4,
-		dropout: bool = False,
-		p: float = 0.1,
-		gate_init: float = -2.0,
+		geo_dim: int,
+		feature_dim: int,
+		hidden_dim: int = 12,
+		gate_floor: float = 0.20,
+		bias_init: float = 2.0,
+		fusion_gain: float = 0.50,
 	) -> None:
 		super().__init__()
-		assert d_model % num_groups == 0, "d_model must be divisible by num_groups"
-		self.d_model = d_model
-		self.num_groups = int(num_groups)
-		self.head_dim = d_model // self.num_groups
-		self.query = nn.Linear(d_model, d_model)
-		self.key = nn.Linear(d_model, d_model)
-		self.value = nn.Linear(d_model, d_model)
-		self.proj = nn.Linear(d_model, d_model)
-		self.norm = nn.LayerNorm(d_model)
-		self.use_dropout = dropout
-		self.dropout = nn.Dropout(p=p)
-		self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+		hidden_dim = max(1, int(hidden_dim))
+		self.gate_floor = float(max(0.0, min(gate_floor, 1.0)))
+		self.fusion_gain = float(max(0.0, fusion_gain))
 
-	def forward(self, desc_tokens: torch.Tensor, geo_tokens: torch.Tensor) -> torch.Tensor:
-		"""Return geometry-conditioned descriptor tokens.
+		self.raw_proj = nn.Sequential(
+			nn.Conv2d(geo_dim, hidden_dim, 1, bias=False),
+			nn.BatchNorm2d(hidden_dim),
+			nn.GELU(),
+		)
+		self.memory_proj = nn.Sequential(
+			nn.Conv2d(feature_dim, hidden_dim, 1, bias=False),
+			nn.BatchNorm2d(hidden_dim),
+			nn.GELU(),
+		)
+		self.reliability_head = nn.Sequential(
+			nn.Conv2d(hidden_dim * 2, hidden_dim, 3, padding=1, bias=False),
+			nn.BatchNorm2d(hidden_dim),
+			nn.GELU(),
+			nn.Conv2d(hidden_dim, 1, 1),
+		)
 
-		Args:
-			desc_tokens: (B, N, C), descriptor query tokens.
-			geo_tokens: (B, N, C), geometry memory tokens.
-		"""
-		if desc_tokens.shape != geo_tokens.shape:
+		out_proj = self.reliability_head[-1]
+		if isinstance(out_proj, nn.Conv2d):
+			nn.init.zeros_(out_proj.weight)
+			if out_proj.bias is not None:
+				nn.init.constant_(out_proj.bias, float(bias_init))
+
+	def forward(self, geo_v: torch.Tensor, geo_memory: torch.Tensor):
+		"""Gate NHWC geometry memory using NCHW raw geometry."""
+		if geo_v.dim() != 4 or geo_memory.dim() != 4:
 			raise RuntimeError(
-				"GroupedLinearGeoCrossAttention expects desc_tokens and geo_tokens "
-				f"to have the same shape, got {tuple(desc_tokens.shape)} and {tuple(geo_tokens.shape)}."
+				"GeometryReliabilityGate expects geo_v as NCHW and geo_memory as NHWC, "
+				f"got {tuple(geo_v.shape)} and {tuple(geo_memory.shape)}."
 			)
 
-		B, N, C = desc_tokens.shape
-		q = self.query(desc_tokens).view(B, N, self.num_groups, self.head_dim)
-		k = self.key(geo_tokens).view(B, N, self.num_groups, self.head_dim)
-		v = self.value(geo_tokens).view(B, N, self.num_groups, self.head_dim)
+		geo_memory_map = geo_memory.permute(0, 3, 1, 2)
+		if geo_v.shape[-2:] != geo_memory_map.shape[-2:]:
+			geo_v = F.interpolate(
+				geo_v,
+				size=geo_memory_map.shape[-2:],
+				mode='bilinear',
+				align_corners=False,
+			)
 
-		k_attn = torch.softmax(k, dim=1)
-		geo_context = (k_attn * v).sum(dim=1, keepdim=True)
-		cross = (q * geo_context).reshape(B, N, C)
-		cross = self.proj(cross)
-		if self.use_dropout:
-			cross = self.dropout(cross)
+		raw_feat = self.raw_proj(geo_v)
+		memory_feat = self.memory_proj(geo_memory_map)
+		reliability = torch.sigmoid(self.reliability_head(torch.cat([raw_feat, memory_feat], dim=1)))
+		gate = self.gate_floor + (1.0 - self.gate_floor) * reliability
+		gated_memory = (geo_memory_map * gate * self.fusion_gain).permute(0, 2, 3, 1)
+		return gated_memory, reliability
 
-		gate = torch.sigmoid(self.gate_logit)
-		return self.norm(desc_tokens + gate * cross)
-
-# 负责根据几何可靠性调制 descriptor
+# Geometry-conditioned descriptor residual refinement.
 class GCDR(nn.Module):
 	"""Geo-Conditional Descriptor Refinement.
 
@@ -602,12 +613,14 @@ class GCDR(nn.Module):
 		gate_floor: float = 0.10,
 		residual_gain: float = 1.0,
 		residual_gate_floor: float = 0.10,
+		residual_clip: float = 0.25,
 	):
 		super().__init__()
 		self.dim = dim
 		self.gate_floor = float(max(0.0, min(gate_floor, 1.0)))
 		self.residual_gain = float(max(0.0, residual_gain))
 		self.residual_gate_floor = float(max(0.0, min(residual_gate_floor, 1.0)))
+		self.residual_clip = float(max(0.0, residual_clip))
 
 		self.geo_proj = nn.Sequential(
 			nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
@@ -662,6 +675,8 @@ class GCDR(nn.Module):
 		shift = shift.permute(0, 2, 3, 1)
 
 		residual = desc * scale + shift
+		if self.residual_clip > 0:
+			residual = residual.clamp(min=-self.residual_clip, max=self.residual_clip)
 		residual_gate = self.residual_gate_floor + (1.0 - self.residual_gate_floor) * reliability_map
 		residual_gate = residual_gate.permute(0, 2, 3, 1)
 		out = desc + (self.residual_gain * residual_gate) * residual
@@ -989,16 +1004,17 @@ class FeatureBooster(nn.Module):
 				self.geo_specs.append((name, input_dim)) # Store raw_dim for slicing
 				geo_input_dim += input_dim
 
-		cross_cfg = dict(self.model_config.get('geo_cross_attention', {}))
-		self.use_geo_cross_attention = bool(cross_cfg.get('enabled', True))
-		self.geo_cross_attn = None
-		if self.use_geo_cross_attention:
-			self.geo_cross_attn = GroupedLinearGeoCrossAttention(
-				self.model_config['descriptor_dim'],
-				num_groups=int(cross_cfg.get('num_groups', 4)),
-				dropout=dropout,
-				p=p,
-				gate_init=float(cross_cfg.get('gate_init', -2.0)),
+		total_geo_input_dim = geo_input_dim
+		gate_cfg = dict(self.model_config.get('geo_reliability_gate', {}))
+		self.geo_reliability_gate = None
+		if bool(gate_cfg.get('enabled', False)) and total_geo_input_dim > 0:
+			self.geo_reliability_gate = GeometryReliabilityGate(
+				geo_dim=total_geo_input_dim,
+				feature_dim=self.model_config['descriptor_dim'],
+				hidden_dim=int(gate_cfg.get('hidden_dim', 12)),
+				gate_floor=float(gate_cfg.get('gate_floor', 0.20)),
+				bias_init=float(gate_cfg.get('bias_init', 2.0)),
+				fusion_gain=float(gate_cfg.get('fusion_gain', 0.50)),
 			)
 
 		self.attn_proj = AttentionalNN(feature_dim=self.model_config['descriptor_dim'], layer_num=self.model_config['attention_layers'], model_config=self.model_config, dropout=dropout)
@@ -1012,10 +1028,6 @@ class FeatureBooster(nn.Module):
 		# Modes: 'None', 'GCDR'
 		self.refiner_type = model_config['refiner_type']
 		self.pre_attn_refiner = None  # Pre-attention refiner slot (GCDR)
-		total_geo_channels = sum(
-			dim for name, dim in self.geo_raw_dims.items()
-			if model_config['geometric_features'][name]
-		)
 		if self.refiner_type == 'None':
 			pass
 		elif self.refiner_type == 'GCDR':
@@ -1024,12 +1036,13 @@ class FeatureBooster(nn.Module):
 			gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
 			self.pre_attn_refiner = GCDR(
 				dim=self.model_config['descriptor_dim'],
-				geo_dim=total_geo_channels * geo_token_mult,
+				geo_dim=total_geo_input_dim,
 				geo_compress=int(gcdr_cfg.get('geo_compress', 8)),
 				reliability_hidden=int(gcdr_cfg.get('reliability_hidden', 16)),
 				gate_floor=float(gcdr_cfg.get('gate_floor', 0.10)),
 				residual_gain=float(gcdr_cfg.get('residual_gain', 1.0)),
 				residual_gate_floor=float(gcdr_cfg.get('residual_gate_floor', 0.10)),
+				residual_clip=float(gcdr_cfg.get('residual_clip', 0.25)),
 			)
 		else:
 			raise ValueError(
@@ -1077,6 +1090,7 @@ class FeatureBooster(nn.Module):
 		# Assume inputs are always 4D dense maps: (B, C, H, W)
 		B, C, H, W = desc.shape
 		geo_reliability_map = None
+		geo_memory_reliability_map = None
 
 		# Ensure geo_v matches desc spatial resolution
 		if geo_v is not None and (geo_v.shape[2] != H or geo_v.shape[3] != W):
@@ -1110,12 +1124,10 @@ class FeatureBooster(nn.Module):
 			if self.use_dropout:
 				geo_encoded_sum = self.dropout(geo_encoded_sum)
 
-			if self.geo_cross_attn is not None:
-				desc_tokens = d_encoded.reshape(B, H * W, C)
-				geo_tokens = geo_encoded_sum.reshape(B, H * W, C)
-				fused_desc = self.geo_cross_attn(desc_tokens, geo_tokens).reshape(B, H, W, C)
-			else:
-				fused_desc = d_encoded + geo_encoded_sum
+			if self.geo_reliability_gate is not None:
+				geo_encoded_sum, geo_memory_reliability_map = self.geo_reliability_gate(geo_v, geo_encoded_sum)
+
+			fused_desc = d_encoded + geo_encoded_sum
 		else:
 			fused_desc = d_encoded
 
@@ -1125,7 +1137,7 @@ class FeatureBooster(nn.Module):
 			fused_desc, geo_reliability_map = self.pre_attn_refiner(fused_desc, geo_v)
 		desc = fused_desc
 
-		# 4. Cross Attention Boosting
+		# 4. AFT descriptor context refinement
 		B_curr, H_curr, W_curr, C_curr = desc.shape
 		desc_flat = desc.reshape(B_curr, H_curr * W_curr, C_curr)
 		desc_flat = self.attn_proj(desc_flat, shape=(H_curr, W_curr))
@@ -1145,6 +1157,8 @@ class FeatureBooster(nn.Module):
 		repeatability_map = self.repeatability_head(desc_map)
 
 		aux_outputs = {}
+		if geo_memory_reliability_map is not None:
+			aux_outputs['geo_memory_reliability_map'] = geo_memory_reliability_map
 		if geo_reliability_map is not None:
 			aux_outputs['geo_reliability_map'] = geo_reliability_map
 

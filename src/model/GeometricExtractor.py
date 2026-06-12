@@ -145,13 +145,13 @@ class GeometricExtractor(nn.Module):
 
             depth_list = []
             for img in imgs_np:
-                d, _, _, _ = self.depth_extractor.extract(img, target_size=(H, W))
+                d = self.depth_extractor.extract_depth(img, target_size=(H, W))
                 depth_list.append(d)
             return torch.stack(depth_list).unsqueeze(1)
 
         if isinstance(image, np.ndarray):
             target_size = (image.shape[0], image.shape[1])
-            d, _, _, _ = self.depth_extractor.extract(image, target_size=target_size)
+            d = self.depth_extractor.extract_depth(image, target_size=target_size)
             return d.unsqueeze(0).unsqueeze(0)
 
         raise ValueError("Image must be torch.Tensor or numpy.ndarray")

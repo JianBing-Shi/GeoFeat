@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -137,11 +138,18 @@ class GeoFeatLoss(nn.Module):
 				lam_kpts_raw=1,
 				lam_heatmap=1,
 				lam_reliability=0.0,
-				lam_normals=1,
 				lam_depth=1,
-				lam_gradients=10,
-				lam_curvature=10,
+				lam_gradients=2,
+				lam_curvature=1,
 				lam_repeatability=0.1,
+				lam_descriptor_protect=0.0,
+				lam_reliable_enhance=0.0,
+				lam_unreliable_suppress=0.0,
+				reliable_enhance_margin=0.02,
+				reliable_enhance_threshold=0.60,
+				reliable_enhance_quantile=0.50,
+				unreliable_suppress_threshold=0.45,
+				unreliable_suppress_quantile=0.25,
 				reliability_consistency_weight=0.25,
 				reliability_target_scale=6.0,
 				depth_spvs=True, 
@@ -155,12 +163,19 @@ class GeoFeatLoss(nn.Module):
 		self.lam_kpts_raw=lam_kpts_raw            # raw关键点检测损失权重
 		self.lam_heatmap=lam_heatmap              # 热力图损失权重
 		self.lam_reliability=lam_reliability      # 几何可靠性监督损失权重
-		self.lam_normals=lam_normals              # 法向量一致性损失权重
 		self.lam_depth=lam_depth                  # 深度估计损失权重
 		self.lam_gradients=lam_gradients          # 深度梯度损失权重
 		self.lam_curvature=lam_curvature          # 曲率一致性损失权重
 		self.lam_repeatability=lam_repeatability  # 重复性一致性损失权重
 		self.depth_spvs=depth_spvs                # 是否启用深度监督
+		self.lam_descriptor_protect = float(lam_descriptor_protect)
+		self.lam_reliable_enhance = float(lam_reliable_enhance)
+		self.lam_unreliable_suppress = float(lam_unreliable_suppress)
+		self.reliable_enhance_margin = float(reliable_enhance_margin)
+		self.reliable_enhance_threshold = float(reliable_enhance_threshold)
+		self.reliable_enhance_quantile = float(max(0.0, min(reliable_enhance_quantile, 1.0)))
+		self.unreliable_suppress_threshold = float(unreliable_suppress_threshold)
+		self.unreliable_suppress_quantile = float(max(0.0, min(unreliable_suppress_quantile, 1.0)))
 		self.reliability_consistency_weight = float(reliability_consistency_weight)
 		self.reliability_target_scale = float(reliability_target_scale)
 		self.geo_config = geo_config if geo_config is not None else {}
@@ -178,6 +193,15 @@ class GeoFeatLoss(nn.Module):
 		self.loss_gradients=0       # 梯度损失
 		self.loss_curvature=0       # 曲率损失
 		self.loss_repeatability=0   # 重复性一致性损失
+		self.loss_descriptor_protect = 0
+		self.loss_reliable_enhance = 0
+		self.loss_unreliable_suppress = 0
+		self.reliable_enhance_rate = 0
+		self.reliable_region_ratio = 0
+		self.unreliable_enhance_rate = 0
+		self.unreliable_region_ratio = 0
+		self.reliable_mean_gain = 0
+		self.unreliable_mean_gain = 0
 		
 		# 当前批次精度指标
 		self.acc_coarse=0           # 粗匹配精度
@@ -387,6 +411,162 @@ class GeoFeatLoss(nn.Module):
 			return torch.tensor(0.0, device=self.dev)
 
 		return torch.cat(loss, dim=-1).mean()
+
+	def compute_descriptor_protect_loss(self, descs1, descs2, fb_descs1, fb_descs2, pts):
+		"""Keep geometry-enhanced descriptors close to the raw descriptor anchor."""
+		loss = []
+		B = descs1.shape[0]
+		for b in range(B):
+			pts1, pts2 = pts[b][:, :2], pts[b][:, 2:]
+			raw1 = descs1[b, :, pts1[:, 1].long(), pts1[:, 0].long()].permute(1, 0).detach()
+			raw2 = descs2[b, :, pts2[:, 1].long(), pts2[:, 0].long()].permute(1, 0).detach()
+			ref1 = fb_descs1[b, :, pts1[:, 1].long(), pts1[:, 0].long()].permute(1, 0)
+			ref2 = fb_descs2[b, :, pts2[:, 1].long(), pts2[:, 0].long()].permute(1, 0)
+			raw1 = F.normalize(raw1, p=2, dim=1)
+			raw2 = F.normalize(raw2, p=2, dim=1)
+			ref1 = F.normalize(ref1, p=2, dim=1)
+			ref2 = F.normalize(ref2, p=2, dim=1)
+			loss_per = 0.5 * (
+				(1.0 - (raw1 * ref1).sum(dim=1)).mean() +
+				(1.0 - (raw2 * ref2).sum(dim=1)).mean()
+			)
+			loss.append(loss_per.unsqueeze(0))
+		return torch.cat(loss, dim=-1).mean() if loss else torch.tensor(0.0, device=self.dev)
+
+	def _reliability_region_masks(self, reliability: torch.Tensor):
+		"""Return disjoint low/high reliability masks for geometry selectivity.
+
+		Low reliability is reserved first, then high reliability is selected from
+		the remaining points. This makes the enhancement/suppression evidence
+		well-defined even when reliability values are tied at initialization.
+		"""
+		r = reliability.detach().float().reshape(-1)
+		low_mask = torch.zeros_like(r, dtype=torch.bool)
+		high_mask = torch.zeros_like(r, dtype=torch.bool)
+		n = int(r.numel())
+		if n == 0:
+			return low_mask.reshape_as(reliability).bool(), high_mask.reshape_as(reliability).bool()
+
+		order = torch.argsort(r, descending=False, stable=True)
+		low_k = 0
+		if self.unreliable_suppress_quantile > 0:
+			low_k = max(1, int(math.ceil(float(n) * self.unreliable_suppress_quantile)))
+			low_k = min(low_k, n)
+		high_k = 0
+		if self.reliable_enhance_quantile > 0:
+			high_k = max(1, int(math.ceil(float(n) * self.reliable_enhance_quantile)))
+			high_k = min(high_k, max(0, n - low_k))
+
+		if low_k > 0:
+			low_idx = order[:low_k]
+			threshold_idx = low_idx[r[low_idx] < self.unreliable_suppress_threshold]
+			if threshold_idx.numel() == 0:
+				threshold_idx = low_idx
+			low_mask[threshold_idx] = True
+		else:
+			low_mask = r < self.unreliable_suppress_threshold
+
+		available = ~low_mask
+		if high_k > 0 and available.any():
+			high_order = order[available[order]]
+			high_idx = high_order[-high_k:]
+			threshold_idx = high_idx[r[high_idx] >= self.reliable_enhance_threshold]
+			if threshold_idx.numel() == 0:
+				threshold_idx = high_idx
+			high_mask[threshold_idx] = True
+		else:
+			high_mask = (r >= self.reliable_enhance_threshold) & available
+
+		high_mask = high_mask & ~low_mask
+		return low_mask.reshape_as(reliability), high_mask.reshape_as(reliability)
+
+	def _high_reliability_mask(self, reliability: torch.Tensor) -> torch.Tensor:
+		"""Select the most reliable matched points for positive enhancement."""
+		_, high_mask = self._reliability_region_masks(reliability)
+		return high_mask
+
+	def _low_reliability_mask(self, reliability: torch.Tensor) -> torch.Tensor:
+		"""Select the least reliable matched points for suppressing geometry gains."""
+		low_mask, _ = self._reliability_region_masks(reliability)
+		return low_mask
+
+	def compute_reliable_enhance_loss(self, reliability1, reliability2, pts, raw_conf_list, refined_conf_list):
+		"""Require descriptor gains mainly in regions predicted as reliable."""
+		if reliability1 is None or reliability2 is None:
+			zero = torch.tensor(0.0, device=self.dev)
+			return zero, zero, zero, zero
+
+		loss = []
+		enhance_rates = []
+		region_ratios = []
+		mean_gains = []
+		for b in range(reliability1.shape[0]):
+			pts1, pts2 = pts[b][:, :2], pts[b][:, 2:]
+			r1 = reliability1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()]
+			r2 = reliability2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()]
+			r = 0.5 * (r1 + r2)
+			raw_conf = raw_conf_list[b].detach().to(device=r.device, dtype=r.dtype)
+			refined_conf = refined_conf_list[b].to(device=r.device, dtype=r.dtype)
+			gain = refined_conf - raw_conf
+			reliable_mask = self._high_reliability_mask(r)
+			region_ratios.append(reliable_mask.float().mean().unsqueeze(0))
+			if reliable_mask.any():
+				reliable_gain = gain[reliable_mask]
+				loss_per = F.relu(self.reliable_enhance_margin - reliable_gain).mean()
+				enhance_rate = (reliable_gain > 0).float().mean()
+				mean_gain = reliable_gain.mean()
+			else:
+				loss_per = torch.tensor(0.0, device=self.dev)
+				enhance_rate = torch.tensor(0.0, device=self.dev)
+				mean_gain = torch.tensor(0.0, device=self.dev)
+			loss.append(loss_per.unsqueeze(0))
+			enhance_rates.append(enhance_rate.unsqueeze(0))
+			mean_gains.append(mean_gain.unsqueeze(0))
+
+		loss_value = torch.cat(loss, dim=-1).mean() if loss else torch.tensor(0.0, device=self.dev)
+		rate_value = torch.cat(enhance_rates, dim=-1).mean() if enhance_rates else torch.tensor(0.0, device=self.dev)
+		ratio_value = torch.cat(region_ratios, dim=-1).mean() if region_ratios else torch.tensor(0.0, device=self.dev)
+		gain_value = torch.cat(mean_gains, dim=-1).mean() if mean_gains else torch.tensor(0.0, device=self.dev)
+		return loss_value, rate_value.detach(), ratio_value.detach(), gain_value.detach()
+
+	def compute_unreliable_suppress_loss(self, reliability1, reliability2, pts, raw_conf_list, refined_conf_list):
+		"""Suppress positive descriptor gains where geometry is predicted unreliable."""
+		if reliability1 is None or reliability2 is None:
+			zero = torch.tensor(0.0, device=self.dev)
+			return zero, zero, zero, zero
+
+		loss = []
+		enhance_rates = []
+		region_ratios = []
+		mean_gains = []
+		for b in range(reliability1.shape[0]):
+			pts1, pts2 = pts[b][:, :2], pts[b][:, 2:]
+			r1 = reliability1[b, 0, pts1[:, 1].long(), pts1[:, 0].long()]
+			r2 = reliability2[b, 0, pts2[:, 1].long(), pts2[:, 0].long()]
+			r = 0.5 * (r1 + r2)
+			raw_conf = raw_conf_list[b].detach().to(device=r.device, dtype=r.dtype)
+			refined_conf = refined_conf_list[b].to(device=r.device, dtype=r.dtype)
+			gain = refined_conf - raw_conf
+			unreliable_mask = self._low_reliability_mask(r)
+			region_ratios.append(unreliable_mask.float().mean().unsqueeze(0))
+			if unreliable_mask.any():
+				unreliable_gain = gain[unreliable_mask]
+				loss_per = F.relu(unreliable_gain).mean()
+				enhance_rate = (unreliable_gain > 0).float().mean()
+				mean_gain = unreliable_gain.mean()
+			else:
+				loss_per = torch.tensor(0.0, device=self.dev)
+				enhance_rate = torch.tensor(0.0, device=self.dev)
+				mean_gain = torch.tensor(0.0, device=self.dev)
+			loss.append(loss_per.unsqueeze(0))
+			enhance_rates.append(enhance_rate.unsqueeze(0))
+			mean_gains.append(mean_gain.unsqueeze(0))
+
+		loss_value = torch.cat(loss, dim=-1).mean() if loss else torch.tensor(0.0, device=self.dev)
+		rate_value = torch.cat(enhance_rates, dim=-1).mean() if enhance_rates else torch.tensor(0.0, device=self.dev)
+		ratio_value = torch.cat(region_ratios, dim=-1).mean() if region_ratios else torch.tensor(0.0, device=self.dev)
+		gain_value = torch.cat(mean_gains, dim=-1).mean() if mean_gains else torch.tensor(0.0, device=self.dev)
+		return loss_value, rate_value.detach(), ratio_value.detach(), gain_value.detach()
 	
 	def compute_repeatability_loss(self, repeatability1, repeatability2, pts):
 		"""
@@ -407,74 +587,6 @@ class GeoFeatLoss(nn.Module):
 			loss.append(F.mse_loss(r1, r2).unsqueeze(0))
 		return torch.cat(loss).mean() if loss else torch.tensor(0.0, device=self.dev)
 	
-	def normal_loss(self,normal,target_normal):
-		"""
-		Normal Loss (法向量一致性损失)
-		
-		功能:
-			最小化预测法向量（Prediction Normal）与 Depth-Anything-V2 提取的伪 GT 法向量（Pseudo-GT）
-			之间的夹角（Angular Distance）。
-			用于增强模型对场景平面的感知能力，确保其能预测出正确的表面法向。
-			这一损失仅对 MegaDepth 的 Pseudo-GT 区域有效（Depth-Anything 高置信度区域）。
-			
-		公式:
-			Dot = <N_pred, N_GT> / |N_pred|*|N_GT|
-			Angle = acos(Dot)
-			Loss = mean(Angle[valid_mask])
-			
-		参数:
-			normal (3, H, W): 预测法向量
-			target_normal (3, H, W): GT法向量
-		"""
-		# import pdb;pdb.set_trace()
-		# Resize target_normal to match normal's spatial dimensions
-		if normal.shape[1:] != target_normal.shape[1:]:
-			target_normal = F.interpolate(target_normal.unsqueeze(0), size=normal.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
-
-		normal = normal.permute(1, 2, 0)
-		target_normal = target_normal.permute(1,2,0)
-		# loss = F.l1_loss(d_feat, depth_anything_normal_feat)
-		dot = torch.cosine_similarity(normal, target_normal, dim=2)
-		valid_mask = target_normal[:, :, 0].float() \
-					* (dot.detach() < 0.999).float() \
-					* (dot.detach() > -0.999).float()
-		valid_mask = valid_mask > 0.0
-		al = torch.acos(dot[valid_mask])
-		loss = torch.mean(al)
-		return loss
-	
-	
-	def compute_normals_loss(self,normals1,normals2,DA_normals1,DA_normals2,megadepth_batch_size,coco_batch_size):
-		loss=[]
-		
-		# LiftFeat style: only MegaDepth image need depth-normal
-		# Slice by skipping COCO images at the beginning
-		if normals1.shape[0] > coco_batch_size:
-			cur_normals1 = normals1[coco_batch_size:, ...]
-			cur_normals2 = normals2[coco_batch_size:, ...]
-		else:
-			# Fallback if batch size is smaller than expected (e.g. dry run or config change)
-			cur_normals1 = normals1
-			cur_normals2 = normals2
-
-		# Iterate over available Pseudo-GT normals
-		for b in range(len(DA_normals1)):
-			# Safety check to avoid index out of bounds if predictions are fewer than GT
-			if b >= cur_normals1.shape[0]:
-				break
-				
-			normal1, normal2 = cur_normals1[b], cur_normals2[b]
-			loss_per1 = self.normal_loss(normal1, DA_normals1[b].permute(2, 0, 1))
-			loss_per2 = self.normal_loss(normal2, DA_normals2[b].permute(2, 0, 1))
-			loss_per = (loss_per1 + loss_per2)
-			loss.append(loss_per.unsqueeze(0))
-		
-		if len(loss) == 0:
-			return torch.tensor(0.0, device=self.dev, requires_grad=True)
-
-		loss=torch.cat(loss,dim=-1).mean()
-		return loss
-
 	def _split_geo_features(self, geo_map):
 		geo_dict = {}
 		geo_idx = 0
@@ -540,40 +652,57 @@ class GeoFeatLoss(nn.Module):
 			sample_key = next(iter(cur_geo1))
 			num_samples = min(len(cur_DA_depths1), cur_geo1[sample_key].shape[0])
 			
+			def as_bchw(x):
+				x = x.to(device=self.dev, dtype=torch.float32)
+				if x.dim() == 2:
+					return x.unsqueeze(0).unsqueeze(0)
+				if x.dim() == 3:
+					return x.unsqueeze(0)
+				if x.dim() == 4:
+					return x
+				raise ValueError(f"Expected 2D/3D/4D geometry tensor, got shape {tuple(x.shape)}")
+
+			def resize_target(x, size):
+				x = as_bchw(x)
+				if x.shape[-2:] != size:
+					x = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
+				return x
+
+			def min_max_norm(d):
+				d_min = d.min()
+				d_max = d.max()
+				if d_max - d_min > 1e-6:
+					return (d - d_min) / (d_max - d_min)
+				return torch.zeros_like(d)
+
+			def prepare_target_geometry(target, size):
+				if isinstance(target, dict):
+					depth = resize_target(target['depth'], size)
+					geo_target = {
+						'depth': min_max_norm(depth),
+					}
+					if 'gradients' in target:
+						geo_target['gradients'] = resize_target(target['gradients'], size)
+					if 'curvatures' in target:
+						geo_target['curvatures'] = resize_target(target['curvatures'], size)
+					if 'gradients' not in geo_target or 'curvatures' not in geo_target:
+						geo_target['derived'] = self.curvature_computer(geo_target['depth'], return_all=True)
+					return geo_target
+
+				depth = resize_target(target, size)
+				depth = min_max_norm(depth)
+				return {
+					'depth': depth,
+					'derived': self.curvature_computer(depth, return_all=True),
+				}
+
 			for b in range(num_samples):
-				# Prepare target depth: ensure (1, 1, H, W)
-				d_target1 = cur_DA_depths1[b]
-				if d_target1.dim() == 2:
-					d_target1 = d_target1.unsqueeze(0).unsqueeze(0)
-				elif d_target1.dim() == 3:
-					d_target1 = d_target1.unsqueeze(0)
-					
-				d_target2 = cur_DA_depths2[b]
-				if d_target2.dim() == 2:
-					d_target2 = d_target2.unsqueeze(0).unsqueeze(0)
-				elif d_target2.dim() == 3:
-					d_target2 = d_target2.unsqueeze(0)
-				
 				# Get prediction size
 				_, _, H_pred, W_pred = cur_geo1[sample_key].shape
-				
-				# Interpolate targets to match prediction size
-				if d_target1.shape[-2:] != (H_pred, W_pred):
-					d_target1 = F.interpolate(d_target1, size=(H_pred, W_pred), mode='bilinear', align_corners=False)
-				if d_target2.shape[-2:] != (H_pred, W_pred):
-					d_target2 = F.interpolate(d_target2, size=(H_pred, W_pred), mode='bilinear', align_corners=False)
-
-				# Normalize target depth using Affine-Invariant Normalization (Min-Max)
-				# This is robust to scale and shift ambiguity and guarantees [0, 1] range
-				def min_max_norm(d):
-					d_min = d.min()
-					d_max = d.max()
-					if d_max - d_min > 1e-6:
-						return (d - d_min) / (d_max - d_min)
-					return torch.zeros_like(d)
-
-				d_target1 = min_max_norm(d_target1)
-				d_target2 = min_max_norm(d_target2)
+				target1 = prepare_target_geometry(cur_DA_depths1[b], (H_pred, W_pred))
+				target2 = prepare_target_geometry(cur_DA_depths2[b], (H_pred, W_pred))
+				d_target1 = target1['depth']
+				d_target2 = target2['depth']
 
 				# Depth Loss
 				if self.geo_config['depth'] and 'depth' in cur_geo1:
@@ -587,26 +716,32 @@ class GeoFeatLoss(nn.Module):
 					l_d = self.lam_depth * (F.l1_loss(d_pred1_norm, d_target1) + F.l1_loss(d_pred2_norm, d_target2))
 					loss_depth_list.append(l_d.unsqueeze(0))
 
-				# Compute derived features for TARGET if needed
+				# Compute geometry losses using the compact DAM-derived contract:
+				# depth + gradients(dx, dy, normal) + curvatures(mean_curv).
 				if self.geo_config['gradients'] or self.geo_config['curvatures']:
-					# Target features are computed from normalized depth
-					# Since d_target is [0, 1], GeometricExtractor won't divide by 255.
-					feat_target1 = self.curvature_computer(d_target1, return_all=True)
-					feat_target2 = self.curvature_computer(d_target2, return_all=True)
-
 					# Gradients
 					if self.geo_config['gradients']:
 						# Extract predicted first-order geometry:
 						# [grad_x, grad_y, normal_x, normal_y, normal_z].
 						pred_grad1 = cur_geo1['gradients'][b]
 						pred_grad2 = cur_geo2['gradients'][b]
+						if 'gradients' in target1:
+							target_grad1 = target1['gradients']
+							target_grad2 = target2['gradients']
+							t_grad_x1, t_grad_y1, t_normal1 = target_grad1[:, 0:1], target_grad1[:, 1:2], target_grad1[:, 2:5]
+							t_grad_x2, t_grad_y2, t_normal2 = target_grad2[:, 0:1], target_grad2[:, 1:2], target_grad2[:, 2:5]
+						else:
+							feat_target1 = target1['derived']
+							feat_target2 = target2['derived']
+							t_grad_x1, t_grad_y1, t_normal1 = feat_target1['grad_x'], feat_target1['grad_y'], feat_target1['normal']
+							t_grad_x2, t_grad_y2, t_normal2 = feat_target2['grad_x'], feat_target2['grad_y'], feat_target2['normal']
 
-						l_g = self.lam_gradients * (F.l1_loss(pred_grad1[0:1].unsqueeze(0), feat_target1['grad_x']) + \
-									F.l1_loss(pred_grad1[1:2].unsqueeze(0), feat_target1['grad_y']) + \
-									F.l1_loss(pred_grad1[2:5].unsqueeze(0), feat_target1['normal']) + \
-									F.l1_loss(pred_grad2[0:1].unsqueeze(0), feat_target2['grad_x']) + \
-									F.l1_loss(pred_grad2[1:2].unsqueeze(0), feat_target2['grad_y']) + \
-									F.l1_loss(pred_grad2[2:5].unsqueeze(0), feat_target2['normal']))
+						l_g = self.lam_gradients * (F.l1_loss(pred_grad1[0:1].unsqueeze(0), t_grad_x1) + \
+									F.l1_loss(pred_grad1[1:2].unsqueeze(0), t_grad_y1) + \
+									F.l1_loss(pred_grad1[2:5].unsqueeze(0), t_normal1) + \
+									F.l1_loss(pred_grad2[0:1].unsqueeze(0), t_grad_x2) + \
+									F.l1_loss(pred_grad2[1:2].unsqueeze(0), t_grad_y2) + \
+									F.l1_loss(pred_grad2[2:5].unsqueeze(0), t_normal2))
 						loss_grad_list.append(l_g.unsqueeze(0))
 
 					# Curvatures
@@ -614,8 +749,14 @@ class GeoFeatLoss(nn.Module):
 						# Extract predicted curvatures (only mean curvature H1)
 						pred_curv1 = cur_geo1['curvatures'][b]  # shape (1, H, W)
 						pred_curv2 = cur_geo2['curvatures'][b]
+						if 'curvatures' in target1:
+							t_curv1 = target1['curvatures']
+							t_curv2 = target2['curvatures']
+						else:
+							t_curv1 = target1['derived']['mean_curv']
+							t_curv2 = target2['derived']['mean_curv']
 
-						l_c = self.lam_curvature * (F.l1_loss(pred_curv1.unsqueeze(0), feat_target1['mean_curv']) + F.l1_loss(pred_curv2.unsqueeze(0), feat_target2['mean_curv']))
+						l_c = self.lam_curvature * (F.l1_loss(pred_curv1.unsqueeze(0), t_curv1) + F.l1_loss(pred_curv2.unsqueeze(0), t_curv2))
 						loss_curv_list.append(l_c.unsqueeze(0))
 		
 		loss_depth = torch.cat(loss_depth_list).mean() if loss_depth_list else torch.tensor(0.0, device=self.dev)
@@ -650,6 +791,11 @@ class GeoFeatLoss(nn.Module):
 		# import pdb;pdb.set_trace()
 		self.loss_descs,self.acc_coarse,conf_list=self.compute_descriptors_loss(descs1,descs2,pts)
 		self.loss_fb_descs,self.acc_fb_coarse,fb_conf_list=self.compute_descriptors_loss(fb_descs1,fb_descs2,pts)
+		if self.lam_descriptor_protect > 0:
+			self.loss_descriptor_protect = self.compute_descriptor_protect_loss(descs1, descs2, fb_descs1, fb_descs2, pts)
+		else:
+			self.loss_descriptor_protect = torch.tensor(0.0, device=self.dev)
+
 		if reliability1 is not None and reliability2 is not None and self.lam_reliability > 0:
 			self.loss_reliability = self.compute_reliability_loss(
 				reliability1,
@@ -660,6 +806,34 @@ class GeoFeatLoss(nn.Module):
 			)
 		else:
 			self.loss_reliability = torch.tensor(0.0, device=self.dev)
+
+		if reliability1 is not None and reliability2 is not None and self.lam_reliable_enhance > 0:
+			self.loss_reliable_enhance, self.reliable_enhance_rate, self.reliable_region_ratio, self.reliable_mean_gain = self.compute_reliable_enhance_loss(
+				reliability1,
+				reliability2,
+				pts,
+				conf_list,
+				fb_conf_list,
+			)
+		else:
+			self.loss_reliable_enhance = torch.tensor(0.0, device=self.dev)
+			self.reliable_enhance_rate = torch.tensor(0.0, device=self.dev)
+			self.reliable_region_ratio = torch.tensor(0.0, device=self.dev)
+			self.reliable_mean_gain = torch.tensor(0.0, device=self.dev)
+
+		if reliability1 is not None and reliability2 is not None and self.lam_unreliable_suppress > 0:
+			self.loss_unreliable_suppress, self.unreliable_enhance_rate, self.unreliable_region_ratio, self.unreliable_mean_gain = self.compute_unreliable_suppress_loss(
+				reliability1,
+				reliability2,
+				pts,
+				conf_list,
+				fb_conf_list,
+			)
+		else:
+			self.loss_unreliable_suppress = torch.tensor(0.0, device=self.dev)
+			self.unreliable_enhance_rate = torch.tensor(0.0, device=self.dev)
+			self.unreliable_region_ratio = torch.tensor(0.0, device=self.dev)
+			self.unreliable_mean_gain = torch.tensor(0.0, device=self.dev)
 
 		if repeatability1 is not None and repeatability2 is not None and self.lam_repeatability > 0:
 			self.loss_repeatability = self.compute_repeatability_loss(repeatability1, repeatability2, pts)
@@ -716,12 +890,20 @@ class GeoFeatLoss(nn.Module):
 			'loss_kpts_refined':self.lam_kpts * self.loss_kpts_refined,
 			'loss_reliability': self.lam_reliability * self.loss_reliability,
 			'loss_repeatability': self.lam_repeatability * self.loss_repeatability,
+			'loss_descriptor_protect': self.lam_descriptor_protect * self.loss_descriptor_protect,
+			'loss_reliable_enhance': self.lam_reliable_enhance * self.loss_reliable_enhance,
+			'loss_unreliable_suppress': self.lam_unreliable_suppress * self.loss_unreliable_suppress,
+			'reliable_enhance_rate': self.reliable_enhance_rate,
+			'reliable_region_ratio': self.reliable_region_ratio,
+			'unreliable_enhance_rate': self.unreliable_enhance_rate,
+			'unreliable_region_ratio': self.unreliable_region_ratio,
+			'reliable_mean_gain': self.reliable_mean_gain,
+			'unreliable_mean_gain': self.unreliable_mean_gain,
 			'kpt_raw_weight':raw_w,
 			'kpt_refined_weight':refined_w,
 			'acc_kpt':self.acc_kpt,
 			
 			'loss_depths': self.lam_depth * self.loss_depths,
-			'loss_normals':self.lam_normals * self.loss_normals,
 			'loss_gradients': self.lam_gradients * self.loss_gradients,
 			'loss_curvature': self.lam_curvature * self.loss_curvature,
 		}
