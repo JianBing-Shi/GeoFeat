@@ -69,9 +69,9 @@ class GeometricExtractor(nn.Module):
         geo_cfg = dict(model_config["geometric_features"])
         resolved = dict(cls.DEFAULT_GEO_CFG)
         resolved.update({
-            "depth": bool(geo_cfg.get("depth", resolved["depth"])),
-            "gradients": bool(geo_cfg.get("gradients", resolved["gradients"])),
-            "curvatures": bool(geo_cfg.get("curvatures", resolved["curvatures"])),
+            "depth": bool(geo_cfg["depth"]),
+            "gradients": bool(geo_cfg["gradients"]),
+            "curvatures": bool(geo_cfg["curvatures"]),
             "normal": False,
         })
         return resolved

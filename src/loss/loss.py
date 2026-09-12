@@ -7,6 +7,22 @@ import torch.nn.functional as F
 import time
 from model.GeometricExtractor import GeometricExtractor
 
+# Public loss defaults live with the loss implementation.  Training code can
+# import this mapping directly; model configuration no longer carries losses.
+DEFAULT_LOSS_CONFIG = {
+	'reliability_loss_weight': 0.25, 'reliability_consistency_weight': 0.25,
+	'reliability_target_scale': 6.0, 'repeatability_loss_weight': 0.03,
+	'depth_weight': 1.0, 'gradient_weight': 5.0, 'curvature_weight': 2.0,
+	'geo_loss_reliability_weighted': True, 'geo_loss_unreliable_floor': 0.25,
+	'descriptor_protect_weight': 0.1, 'reliable_enhance_margin': 0.02,
+	'reliable_enhance_weight': 0.05, 'reliable_enhance_threshold': 0.5,
+	'reliable_enhance_quantile': 0.5, 'unreliable_suppress_weight': 0.1,
+	'unreliable_suppress_threshold': 0.45, 'unreliable_suppress_quantile': 0.25,
+}
+
+def get_loss_config():
+	return dict(DEFAULT_LOSS_CONFIG)
+
 def dual_softmax_loss(X, Y, temp = 0.2):
 	"""
 	Dual Softmax Loss (双重 Softmax 损失)
@@ -152,6 +168,8 @@ class GeoFeatLoss(nn.Module):
 				unreliable_suppress_quantile=0.25,
 				reliability_consistency_weight=0.25,
 				reliability_target_scale=6.0,
+				geo_loss_reliability_weighted=True,
+				geo_loss_unreliable_floor=0.25,
 				depth_spvs=True, 
 				geo_config=None):
 		super().__init__()
@@ -178,6 +196,8 @@ class GeoFeatLoss(nn.Module):
 		self.unreliable_suppress_quantile = float(max(0.0, min(unreliable_suppress_quantile, 1.0)))
 		self.reliability_consistency_weight = float(reliability_consistency_weight)
 		self.reliability_target_scale = float(reliability_target_scale)
+		self.geo_loss_reliability_weighted = bool(geo_loss_reliability_weighted)
+		self.geo_loss_unreliable_floor = float(max(0.0, min(geo_loss_unreliable_floor, 1.0)))
 		self.geo_config = geo_config if geo_config is not None else {}
 		
 		# 当前批次损失值
@@ -601,7 +621,7 @@ class GeoFeatLoss(nn.Module):
 			geo_idx += 1
 		return geo_dict
 
-	def compute_geometric_loss(self, geo_features1, geo_features2, DA_depths1, DA_depths2, megadepth_batch_size):
+	def compute_geometric_loss(self, geo_features1, geo_features2, DA_depths1, DA_depths2, megadepth_batch_size, reliability1=None, reliability2=None):
 		"""
 		Geometric Loss (几何一致性损失：深度、梯度、曲率)
 		
@@ -675,6 +695,27 @@ class GeoFeatLoss(nn.Module):
 					return (d - d_min) / (d_max - d_min)
 				return torch.zeros_like(d)
 
+			def reliability_weight(reliability, b, size):
+				if not self.geo_loss_reliability_weighted or reliability is None:
+					return None
+				r = reliability[-megadepth_batch_size:][b:b+1].detach().to(device=self.dev, dtype=torch.float32)
+				if r.shape[-2:] != size:
+					r = F.interpolate(r, size=size, mode='bilinear', align_corners=False)
+				r = r.clamp(0.0, 1.0)
+				return self.geo_loss_unreliable_floor + (1.0 - self.geo_loss_unreliable_floor) * r
+
+			def weighted_l1(pred, target, weight=None):
+				diff = (pred - target).abs()
+				if weight is None:
+					return diff.mean()
+				if weight.shape[-2:] != diff.shape[-2:]:
+					weight = F.interpolate(weight, size=diff.shape[-2:], mode='bilinear', align_corners=False)
+				while weight.dim() < diff.dim():
+					weight = weight.unsqueeze(1)
+				if weight.shape[1] == 1 and diff.shape[1] != 1:
+					weight = weight.expand(-1, diff.shape[1], -1, -1)
+				return (diff * weight).sum() / weight.sum().clamp_min(1e-6)
+
 			def prepare_target_geometry(target, size):
 				if isinstance(target, dict):
 					depth = resize_target(target['depth'], size)
@@ -703,6 +744,8 @@ class GeoFeatLoss(nn.Module):
 				target2 = prepare_target_geometry(cur_DA_depths2[b], (H_pred, W_pred))
 				d_target1 = target1['depth']
 				d_target2 = target2['depth']
+				rel_w1 = reliability_weight(reliability1, b, (H_pred, W_pred))
+				rel_w2 = reliability_weight(reliability2, b, (H_pred, W_pred))
 
 				# Depth Loss
 				if self.geo_config['depth'] and 'depth' in cur_geo1:
@@ -713,7 +756,7 @@ class GeoFeatLoss(nn.Module):
 					d_pred1_norm = min_max_norm(d_pred1)
 					d_pred2_norm = min_max_norm(d_pred2)
 					
-					l_d = self.lam_depth * (F.l1_loss(d_pred1_norm, d_target1) + F.l1_loss(d_pred2_norm, d_target2))
+					l_d = weighted_l1(d_pred1_norm, d_target1, rel_w1) + weighted_l1(d_pred2_norm, d_target2, rel_w2)
 					loss_depth_list.append(l_d.unsqueeze(0))
 
 				# Compute geometry losses using the compact DAM-derived contract:
@@ -736,12 +779,12 @@ class GeoFeatLoss(nn.Module):
 							t_grad_x1, t_grad_y1, t_normal1 = feat_target1['grad_x'], feat_target1['grad_y'], feat_target1['normal']
 							t_grad_x2, t_grad_y2, t_normal2 = feat_target2['grad_x'], feat_target2['grad_y'], feat_target2['normal']
 
-						l_g = self.lam_gradients * (F.l1_loss(pred_grad1[0:1].unsqueeze(0), t_grad_x1) + \
-									F.l1_loss(pred_grad1[1:2].unsqueeze(0), t_grad_y1) + \
-									F.l1_loss(pred_grad1[2:5].unsqueeze(0), t_normal1) + \
-									F.l1_loss(pred_grad2[0:1].unsqueeze(0), t_grad_x2) + \
-									F.l1_loss(pred_grad2[1:2].unsqueeze(0), t_grad_y2) + \
-									F.l1_loss(pred_grad2[2:5].unsqueeze(0), t_normal2))
+						l_g = weighted_l1(pred_grad1[0:1].unsqueeze(0), t_grad_x1, rel_w1) + \
+									weighted_l1(pred_grad1[1:2].unsqueeze(0), t_grad_y1, rel_w1) + \
+									weighted_l1(pred_grad1[2:5].unsqueeze(0), t_normal1, rel_w1) + \
+									weighted_l1(pred_grad2[0:1].unsqueeze(0), t_grad_x2, rel_w2) + \
+									weighted_l1(pred_grad2[1:2].unsqueeze(0), t_grad_y2, rel_w2) + \
+									weighted_l1(pred_grad2[2:5].unsqueeze(0), t_normal2, rel_w2)
 						loss_grad_list.append(l_g.unsqueeze(0))
 
 					# Curvatures
@@ -756,7 +799,7 @@ class GeoFeatLoss(nn.Module):
 							t_curv1 = target1['derived']['mean_curv']
 							t_curv2 = target2['derived']['mean_curv']
 
-						l_c = self.lam_curvature * (F.l1_loss(pred_curv1.unsqueeze(0), t_curv1) + F.l1_loss(pred_curv2.unsqueeze(0), t_curv2))
+						l_c = weighted_l1(pred_curv1.unsqueeze(0), t_curv1, rel_w1) + weighted_l1(pred_curv2.unsqueeze(0), t_curv2, rel_w2)
 						loss_curv_list.append(l_c.unsqueeze(0))
 		
 		loss_depth = torch.cat(loss_depth_list).mean() if loss_depth_list else torch.tensor(0.0, device=self.dev)
@@ -874,7 +917,15 @@ class GeoFeatLoss(nn.Module):
 		self.loss_normals = torch.tensor(0.0, device=self.dev)
 
 		if self.lam_depth > 0 or self.lam_gradients > 0 or self.lam_curvature > 0:
-			self.loss_depths, self.loss_gradients, self.loss_curvature = self.compute_geometric_loss(geo_features1, geo_features2, DA_depths1, DA_depths2, megadepth_batch_size)
+			self.loss_depths, self.loss_gradients, self.loss_curvature = self.compute_geometric_loss(
+				geo_features1,
+				geo_features2,
+				DA_depths1,
+				DA_depths2,
+				megadepth_batch_size,
+				reliability1=reliability1,
+				reliability2=reliability2,
+			)
 		else:
 			self.loss_depths = torch.tensor(0.0, device=self.dev)
 			self.loss_gradients = torch.tensor(0.0, device=self.dev)

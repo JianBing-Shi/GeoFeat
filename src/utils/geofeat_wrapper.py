@@ -14,10 +14,37 @@ import torch.nn.functional as F
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
 
 from src.model.GeoFeatModel import GeoFeatModel  # noqa: E402
-from src.model.interpolator import InterpolateSparse2d  # noqa: E402
-
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class InterpolateSparse2d(nn.Module):
+	"""Sample dense feature maps at sparse 2D coordinates."""
+
+	def __init__(self, mode="bicubic", align_corners=False):
+		super().__init__()
+		self.mode = mode
+		self.align_corners = align_corners
+
+	def normgrid(self, x, height, width):
+		"""Normalize pixel coordinates to the ``[-1, 1]`` grid range."""
+		return 2.0 * (
+			x / torch.tensor(
+				[width - 1, height - 1],
+				device=x.device,
+				dtype=x.dtype,
+			)
+		) - 1.0
+
+	def forward(self, x, pos, height, width):
+		"""Return sampled features with shape ``[B, N, C]``."""
+		grid = self.normgrid(pos, height, width).unsqueeze(-2).to(x.dtype)
+		x = F.grid_sample(
+			x,
+			grid,
+			mode=self.mode,
+			align_corners=self.align_corners,
+		)
+		return x.permute(0, 2, 3, 1).squeeze(-2)
 
 
 REQUIRED_MODEL_CONFIG_KEYS = {
@@ -59,7 +86,7 @@ def validate_model_config(model_config: Optional[dict]) -> dict:
 		)
 
 	cfg = dict(model_config)
-	geo_cfg = cfg.get("geometric_features")
+	geo_cfg = cfg["geometric_features"]
 	if not isinstance(geo_cfg, dict):
 		raise ValueError("model_config['geometric_features'] must be a dict")
 
@@ -73,7 +100,7 @@ def validate_model_config(model_config: Optional[dict]) -> dict:
 	return cfg
 
 
-def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
+def normalize_legacy_model_config(model_config: Optional[dict], state_dict: Optional[dict] = None) -> dict:
 	"""Patch older config snapshots so evaluation/inference can load archived checkpoints."""
 	if model_config is None:
 		raise ValueError("model_config is required, got None")
@@ -105,25 +132,65 @@ def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
 		if key not in cfg:
 			cfg[key] = value
 			print(f"Warning: model_config missing '{key}'; fallback to {value!r}.")
-	geo_cfg = cfg.get("geometric_features")
+	cfg.setdefault("gcdr_config", {})
+	cfg.setdefault("loss_config", {})
+	if "backbone_channels" not in cfg:
+		if int(cfg["descriptor_dim"]) >= 128:
+			cfg["backbone_channels"] = [32, 32, 64, 128, 128]
+		else:
+			cfg["backbone_channels"] = [20, 20, 40, 80, 96]
+	if "head_in_channels" not in cfg and isinstance(state_dict, dict):
+		head_weight = state_dict["keypoint_head.layer1.layer.0.weight"] if "keypoint_head.layer1.layer.0.weight" in state_dict else None
+		if head_weight is not None and getattr(head_weight, "shape", None) is not None:
+			cfg["head_in_channels"] = int(head_weight.shape[1])
+	if "descriptor_head_channels" not in cfg and isinstance(state_dict, dict):
+		desc_key = "descriptor_head.layer.0.layer.0.weight"
+		desc_weight = state_dict[desc_key] if desc_key in state_dict else None
+		if desc_weight is not None and getattr(desc_weight, "shape", None) is not None:
+			cfg["descriptor_head_channels"] = [int(desc_weight.shape[0]), 64]
+	if "keypoint_head_channels" not in cfg and isinstance(state_dict, dict):
+		kpt_channels = []
+		for layer_idx in range(1, 6):
+			kpt_key = f"keypoint_head.layer{layer_idx}.layer.0.weight"
+			kpt_weight = state_dict[kpt_key] if kpt_key in state_dict else None
+			if kpt_weight is not None and getattr(kpt_weight, "shape", None) is not None:
+				kpt_channels.append(int(kpt_weight.shape[0]))
+		if kpt_channels:
+			cfg["keypoint_head_channels"] = kpt_channels
+	geo_cfg = cfg["geometric_features"]
 	if isinstance(geo_cfg, dict):
 		geo_cfg = dict(geo_cfg)
-		if bool(geo_cfg.get("normal", False)):
-			geo_cfg["gradients"] = True
-			print("Warning: merged legacy standalone normal geometry into 'gradients'.")
-		geo_cfg["normal"] = False
+		geo_cfg.setdefault("normal", False)
+		if bool(geo_cfg["normal"]):
+			# Old checkpoints used a standalone normal branch while the current
+			# mainline packs normals into gradients. Preserve the checkpoint's
+			# real contract when its weights prove it was trained that way.
+			legacy_grad_key = "attn_fusion.geo_encoders.gradients.encoder.0.weight"
+			legacy_grad_weight = state_dict[legacy_grad_key] if isinstance(state_dict, dict) and legacy_grad_key in state_dict else None
+			legacy_standalone_normal = (
+				legacy_grad_weight is not None
+				and getattr(legacy_grad_weight, "shape", None) is not None
+				and int(legacy_grad_weight.shape[1]) in (2, 128)
+			)
+			if not legacy_standalone_normal:
+				geo_cfg["gradients"] = True
+				geo_cfg["normal"] = False
 		cfg["geometric_features"] = geo_cfg
-	gate_cfg = cfg.get("geo_reliability_gate")
+	gate_cfg = cfg["geo_reliability_gate"]
 	if isinstance(gate_cfg, dict):
 		gate_cfg = dict(gate_cfg)
 		gate_cfg.setdefault("fusion_gain", 0.50)
 		cfg["geo_reliability_gate"] = gate_cfg
-	gcdr_cfg = cfg.get("gcdr_config")
+	gcdr_cfg = cfg["gcdr_config"]
 	if isinstance(gcdr_cfg, dict):
 		gcdr_cfg = dict(gcdr_cfg)
 		gcdr_cfg.setdefault("residual_clip", 0.25)
+		gcdr_cfg.setdefault("complementarity_enabled", False)
+		gcdr_cfg.setdefault("texture_kernel_size", 5)
+		gcdr_cfg.setdefault("texture_temperature", 8.0)
+		gcdr_cfg.setdefault("complementarity_floor", 0.25)
 		cfg["gcdr_config"] = gcdr_cfg
-	loss_cfg = cfg.get("loss_config")
+	loss_cfg = cfg["loss_config"]
 	if isinstance(loss_cfg, dict):
 		loss_cfg = dict(loss_cfg)
 		loss_cfg.setdefault("descriptor_protect_weight", 0.0)
@@ -138,7 +205,7 @@ def normalize_legacy_model_config(model_config: Optional[dict]) -> dict:
 	return cfg
 
 
-def load_model_config_snapshot(snapshot_path: str) -> dict:
+def load_model_config_snapshot(snapshot_path: str, state_dict: Optional[dict] = None) -> dict:
 	"""Load and normalize a config snapshot produced by training."""
 	if not os.path.isfile(snapshot_path):
 		raise FileNotFoundError(f"Config snapshot not found: {snapshot_path}")
@@ -147,7 +214,7 @@ def load_model_config_snapshot(snapshot_path: str) -> dict:
 		payload = json.load(handle)
 	if isinstance(payload, dict) and "model_config" in payload:
 		payload = payload["model_config"]
-	return normalize_legacy_model_config(payload)
+	return normalize_legacy_model_config(payload, state_dict=state_dict)
 
 
 def load_model_config_for_weights(weight_path: str) -> dict:
@@ -155,7 +222,24 @@ def load_model_config_for_weights(weight_path: str) -> dict:
 	if not weight_path:
 		raise ValueError("weight_path is required to locate config_snapshot.json")
 	snapshot_path = os.path.join(os.path.dirname(os.path.abspath(weight_path)), "config_snapshot.json")
-	return load_model_config_snapshot(snapshot_path)
+	state_dict = None
+	if os.path.isfile(weight_path):
+		state_dict = _read_checkpoint_state_dict(weight_path)
+	return load_model_config_snapshot(snapshot_path, state_dict=state_dict)
+
+
+def _read_checkpoint_state_dict(weight_path: str) -> dict:
+	"""Read a checkpoint state dict and normalize common wrapper keys."""
+	state = torch.load(weight_path, map_location="cpu")
+	if isinstance(state, dict):
+		if "model_state_dict" in state:
+			state = state["model_state_dict"]
+		elif "state_dict" in state:
+			state = state["state_dict"]
+
+	if isinstance(state, dict) and any(k.startswith("module.") for k in state.keys()):
+		state = {k.replace("module.", "", 1): v for k, v in state.items()}
+	return state
 
 
 def load_model(model: nn.Module, weight_path: Optional[str]) -> nn.Module:
@@ -168,16 +252,7 @@ def load_model(model: nn.Module, weight_path: Optional[str]) -> nn.Module:
 		print(f"Warning: weight file not found: {weight_path}, using randomly initialized GeoFeat.")
 		return model
 
-	state = torch.load(weight_path, map_location="cpu")
-	if isinstance(state, dict):
-		if "model_state_dict" in state:
-			state = state["model_state_dict"]
-		elif "state_dict" in state:
-			state = state["state_dict"]
-
-	# Strip potential DataParallel prefixes for compatibility
-	if any(k.startswith("module.") for k in state.keys()):
-		state = {k.replace("module.", "", 1): v for k, v in state.items()}
+	state = _read_checkpoint_state_dict(weight_path)
 
 	model_sd = model.state_dict()
 
@@ -209,7 +284,7 @@ def load_model(model: nn.Module, weight_path: Optional[str]) -> nn.Module:
 
 
 class NonMaxSuppression(nn.Module):
-	def __init__(self, rep_thr: float = 0.1, top_k: int = 4096, kernel_size: int = 5):
+	def __init__(self, rep_thr: float = 0.1, top_k: int = 0, kernel_size: int = 5):
 		super().__init__()
 		self.rep_thr = rep_thr
 		self.top_k = top_k
@@ -250,16 +325,16 @@ class GeoFeat:
 		self,
 		model_config: Optional[dict] = None,
 		weight_path: Optional[str] = None,
-		top_k: int = 4096,
-		detect_threshold: float = 0.05,
-		nms_kernel_size: int = 7,
-		match_min_cossim: float = 0.05,       # Dynamically adjusted from 0.1 for richer match pools in indoor low-texture scene
-		match_ratio_thresh: float = 0.85,     # Broadened from 0.82 to fit close-range rotation warping
+		top_k: int = 0,
+		detect_threshold: float = 0.1,
+		nms_kernel_size: int = 5,
+		match_min_cossim: float = -1.0,
+		match_ratio_thresh: float = -1.0,
 		descriptor_source: str = "refined",
 		keypoint_source: str = "refined",
 		descriptor_confidence_gain: float = 0.0,
 		repeatability_adaptive_gamma: float = 0.0,
-		force_bn_train: bool = True,          # Changed to True: Domain adaptation for indoor test distributions
+		force_bn_train: bool = False,
 	):
 		self.device = device
 		self.top_k = top_k

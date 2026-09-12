@@ -186,15 +186,15 @@ class DepthAnythingExtractor(nn.Module):
         self.input_size = input_size # Used as process_res for DA3
         self.process_size = process_size # Output size (H, W)
         
-        model_name = MODEL_MAP.get(encoder_type, "da3-small")
+        model_name = MODEL_MAP[encoder_type]
         print(f"Initializing Depth Anything 3 model: {model_name}")
         
         # Initialize model structure without loading weights from Hub
         self.net = DepthAnything3(model_name=model_name)
         
         # Load weights locally
-        ckpt_path = CHECKPOINT_MAP.get(model_name)
-        if ckpt_path and os.path.exists(ckpt_path):
+        ckpt_path = CHECKPOINT_MAP[model_name]
+        if os.path.exists(ckpt_path):
             print(f"Loading local checkpoint: {ckpt_path}")
             if ckpt_path.endswith(".safetensors"):
                 from safetensors.torch import load_file

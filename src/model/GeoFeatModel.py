@@ -18,6 +18,77 @@ import sys
 from typing import List, Tuple, Optional
 from src.config.config import get_cfg_defaults, get_model_config
 
+# Canonical architecture/loss contract frozen from
+# weights_0601/GRR50_20260617_030552/config_snapshot.json.
+# Keep these values in code so experiment YAML files cannot silently change the
+# model or objective.  Only the explicit ABLATION switches in config.py may
+# disable GCDR/GeoHead for controlled ablation runs.
+FIXED_MODEL_CONFIG = {
+	'backbone': 'RepVGG',
+	'backbone_channels': [20, 20, 40, 80, 96],
+	'keypoint_encoder': [128, 64, 64], 'keypoint_dim': 65,
+	'descriptor_encoder': [96], 'descriptor_dim': 96,
+	'geometric_features': {'depth': True, 'normal': False, 'gradients': True, 'curvatures': True},
+	'depth_encoder': [32, 48], 'depth_dim': 96,
+	'gradient_encoder': [48, 64], 'gradient_dim': 96,
+	'curvature_encoder': [32, 48], 'curvature_dim': 96,
+	'geo_preprocess_mode': 'no_unfold_lite', 'repeatability_alpha': 0.35,
+	'attention_layers': 2,
+	'aft_config': {'num_groups': 4, 'local_kernel_sizes': [3, 5], 'domain_adapt': True,
+		'temperature_min': 0.7, 'temperature_max': 1.6, 'local_base_gain': 1.0, 'corr_base_gain': 0.5},
+	'geo_reliability_gate': {'enabled': True, 'hidden_dim': 12, 'gate_floor': 0.2,
+		'bias_init': 2.0, 'fusion_gain': 0.5},
+	'refiner_type': 'GCDR',
+	'gcdr_config': {'geo_compress': 12, 'reliability_hidden': 12, 'gate_floor': 0.1,
+		'residual_gain': 0.35, 'residual_gate_floor': 0.05, 'residual_clip': 0.1,
+		'complementarity_enabled': False, 'texture_kernel_size': 5,
+		'texture_temperature': 8.0, 'complementarity_floor': 0.25},
+	'last_activation': 'None', 'output_dim': 96,
+	'head_in_channels': 40,
+	'keypoint_head_channels': None,
+	'descriptor_head_channels': None,
+	'repeatability_adaptive_gamma': 0.0,
+	'descriptor_confidence_gain': 0.0,
+}
+
+FIXED_LOSS_CONFIG = {
+	'reliability_loss_weight': 0.25, 'reliability_consistency_weight': 0.25,
+	'reliability_target_scale': 6.0, 'repeatability_loss_weight': 0.03,
+	'depth_weight': 1.0, 'gradient_weight': 5.0, 'curvature_weight': 2.0,
+	'geo_loss_reliability_weighted': True, 'geo_loss_unreliable_floor': 0.25,
+	'descriptor_protect_weight': 0.1, 'reliable_enhance_margin': 0.02,
+	'reliable_enhance_weight': 0.05, 'reliable_enhance_threshold': 0.5,
+	'reliable_enhance_quantile': 0.5, 'unreliable_suppress_weight': 0.1,
+	'unreliable_suppress_threshold': 0.45, 'unreliable_suppress_quantile': 0.25,
+}
+
+def _make_model_config(cfg):
+	"""Build the internal model contract from the public config options."""
+	from copy import deepcopy
+	model = deepcopy(FIXED_MODEL_CONFIG)
+	model['loss_config'] = deepcopy(FIXED_LOSS_CONFIG)
+	model['backbone'] = cfg.MODEL.BACKBONE
+	model['backbone_channels'] = list(cfg.MODEL.BACKBONE_CHANNELS)
+	model['keypoint_encoder'] = list(cfg.MODEL.KEYPOINT_ENCODER)
+	model['keypoint_dim'] = cfg.MODEL.KEYPOINT_DIM
+	model['descriptor_encoder'] = list(cfg.MODEL.DESCRIPTOR_ENCODER)
+	model['descriptor_dim'] = cfg.MODEL.DESCRIPTOR_DIM
+	model['geometric_features'] = {
+		'depth': cfg.MODEL.GEOMETRIC_FEATURES.DEPTH,
+		'normal': False,
+		'gradients': cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS,
+		'curvatures': cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES,
+	}
+	if cfg.ABLATION.DISABLE_GCDR:
+		model['refiner_type'] = 'None'
+	if cfg.ABLATION.DISABLE_GEO_HEAD:
+		model['geometric_features'] = {
+			'depth': False, 'normal': False,
+			'gradients': False, 'curvatures': False,
+		}
+		model['refiner_type'] = 'None'
+	return model
+
 
 """
 foundational functions
@@ -338,31 +409,39 @@ class KeypointHead(nn.Module):
 	Output channel count is normally 65: 64 cell offsets plus a dustbin-style
 	channel, following the SuperPoint/LiftFeat dense detector convention.
 	"""
-	def __init__(self,in_channels,out_channels):
+	def __init__(self,in_channels,out_channels, hidden_channels: Optional[List[int]] = None):
 		super().__init__()
-		self.layer1=BaseLayer(in_channels,32)
-		self.layer2=BaseLayer(32,32)
-		self.layer3=BaseLayer(32,64)
+		hidden_channels = [32, 32, 64] if hidden_channels is None else list(hidden_channels)
+		if not hidden_channels:
+			raise ValueError("KeypointHead hidden_channels must not be empty")
+		prev_channels = int(in_channels)
+		for idx, hidden in enumerate(hidden_channels, start=1):
+			setattr(self, f'layer{idx}', BaseLayer(prev_channels, int(hidden)))
+			prev_channels = int(hidden)
+		self._layer_count = len(hidden_channels)
 
-		self.conv=nn.Conv2d(64,out_channels,kernel_size=3,stride=1,padding=1)
+		self.conv=nn.Conv2d(prev_channels,out_channels,kernel_size=3,stride=1,padding=1)
 		self.bn=nn.BatchNorm2d(out_channels)
 
 	def forward(self,x):
-		x=self.layer1(x)
-		x=self.layer2(x)
-		x=self.layer3(x)
+		for idx in range(1, self._layer_count + 1):
+			x = getattr(self, f'layer{idx}')(x)
 		x=self.bn(self.conv(x))
 		return x
 
 class DescriptorHead(nn.Module):
 	"""Dense descriptor head that predicts one descriptor vector per feature cell."""
-	def __init__(self,in_channels,out_channels):
+	def __init__(self,in_channels,out_channels, hidden_channels: Optional[List[int]] = None):
 		super().__init__()
+		hidden_channels = [32, 64] if hidden_channels is None else list(hidden_channels)
+		if len(hidden_channels) != 2:
+			raise ValueError(f"DescriptorHead hidden_channels must contain 2 integers, got {hidden_channels}")
+		h1, h2 = [int(v) for v in hidden_channels]
 		# Compact descriptor head for the sub-1M-parameter mainline.
 		self.layer=nn.Sequential(
-			BaseLayer(in_channels, 32),
-			BaseLayer(32, 64, activation=True),
-			BaseLayer(64, out_channels, activation=False)
+			BaseLayer(in_channels, h1),
+			BaseLayer(h1, h2, activation=True),
+			BaseLayer(h2, out_channels, activation=False)
 		)
 
 	def forward(self,x):
@@ -397,9 +476,11 @@ class GeoHead(nn.Module):
 	def __init__(self, in_channels: int, geo_cfg: dict):
 		super().__init__()
 		# Track branch names and per-branch channel counts for selective normalization
+		gradient_channels = 2 if bool(geo_cfg['normal']) else 5
 		branch_defs = [
 			('depth', 1),
-			('gradients', 5),
+			('normal', 3),
+			('gradients', gradient_channels),
 			('curvatures', 1),
 		]
 		self._branch_names = []
@@ -453,7 +534,9 @@ class GeoHead(nn.Module):
 		out = []
 		for i, name in enumerate(self._branch_names):
 			p = parts[i]
-			if name == 'gradients' and p.shape[1] >= 5:
+			if name == 'normal':
+				p = F.normalize(p, p=2, dim=1)
+			elif name == 'gradients' and p.shape[1] >= 5:
 				grad_xy = p[:, :2]
 				normal_xyz = F.normalize(p[:, 2:5], p=2, dim=1)
 				p = torch.cat([grad_xy, normal_xyz], dim=1)
@@ -525,13 +608,13 @@ class GeometricEncoder(nn.Module):
 			return self.dropout(self.encoder(x))
 		return self.encoder(x)
 
-# Reliability gate for encoded geometry before additive descriptor fusion.
+# Reliability gate for encoded geometry before descriptor/keypoint modulation.
 class GeometryReliabilityGate(nn.Module):
-	"""Reliability filter for encoded geometry before descriptor fusion.
+	"""Predict where geometry is trustworthy enough to guide refinement.
 
-	The gate looks at both raw geometry and encoded geometry memory. It predicts
-	a spatial reliability map and suppresses unreliable geometry before it is
-	added to the descriptor stream.
+	The gate looks at both raw geometry and encoded geometry memory, but it does
+	not inject that memory into descriptors. Geometry should decide where/how much
+	to enhance, not what the descriptor content should be.
 	"""
 
 	def __init__(
@@ -572,7 +655,7 @@ class GeometryReliabilityGate(nn.Module):
 				nn.init.constant_(out_proj.bias, float(bias_init))
 
 	def forward(self, geo_v: torch.Tensor, geo_memory: torch.Tensor):
-		"""Gate NHWC geometry memory using NCHW raw geometry."""
+		"""Estimate reliability from NCHW raw geometry and NHWC geometry memory."""
 		if geo_v.dim() != 4 or geo_memory.dim() != 4:
 			raise RuntimeError(
 				"GeometryReliabilityGate expects geo_v as NCHW and geo_memory as NHWC, "
@@ -591,9 +674,7 @@ class GeometryReliabilityGate(nn.Module):
 		raw_feat = self.raw_proj(geo_v)
 		memory_feat = self.memory_proj(geo_memory_map)
 		reliability = torch.sigmoid(self.reliability_head(torch.cat([raw_feat, memory_feat], dim=1)))
-		gate = self.gate_floor + (1.0 - self.gate_floor) * reliability
-		gated_memory = (geo_memory_map * gate * self.fusion_gain).permute(0, 2, 3, 1)
-		return gated_memory, reliability
+		return reliability
 
 # Geometry-conditioned descriptor residual refinement.
 class GCDR(nn.Module):
@@ -614,6 +695,10 @@ class GCDR(nn.Module):
 		residual_gain: float = 1.0,
 		residual_gate_floor: float = 0.10,
 		residual_clip: float = 0.25,
+		complementarity_enabled: bool = False,
+		texture_kernel_size: int = 5,
+		texture_temperature: float = 8.0,
+		complementarity_floor: float = 0.25,
 	):
 		super().__init__()
 		self.dim = dim
@@ -621,6 +706,12 @@ class GCDR(nn.Module):
 		self.residual_gain = float(max(0.0, residual_gain))
 		self.residual_gate_floor = float(max(0.0, min(residual_gate_floor, 1.0)))
 		self.residual_clip = float(max(0.0, residual_clip))
+		self.complementarity_enabled = bool(complementarity_enabled)
+		self.texture_kernel_size = int(texture_kernel_size)
+		if self.texture_kernel_size < 3 or self.texture_kernel_size % 2 == 0:
+			self.texture_kernel_size = 5
+		self.texture_temperature = float(max(texture_temperature, 1e-3))
+		self.complementarity_floor = float(max(0.0, min(complementarity_floor, 1.0)))
 
 		self.geo_proj = nn.Sequential(
 			nn.Conv2d(geo_dim, geo_compress, 1, bias=False),
@@ -664,7 +755,53 @@ class GCDR(nn.Module):
 		# geometry, then reused as a gate for all geometry-conditioned residuals.
 		reliability_logits = self.reliability_head(torch.cat([desc_map, geo_feat], dim=1))
 		reliability_map = torch.sigmoid(reliability_logits)
-		gate = self.gate_floor + (1.0 - self.gate_floor) * reliability_map
+		out, effective_reliability, texture_weakness = self.refine_with_reliability(desc, geo_feat, reliability_map)
+		aux = {
+			'effective_reliability_map': effective_reliability,
+			'texture_weakness_map': texture_weakness,
+		}
+		return out, reliability_map, aux
+
+	def forward_with_reliability(self, desc: torch.Tensor, geo_v: torch.Tensor, reliability_map: torch.Tensor):
+		"""Refine descriptors using an externally estimated geometry reliability map."""
+		geo_feat = self.geo_proj(geo_v)
+		if reliability_map.shape[-2:] != geo_feat.shape[-2:]:
+			reliability_map = F.interpolate(
+				reliability_map,
+				size=geo_feat.shape[-2:],
+				mode='bilinear',
+				align_corners=False,
+			)
+		reliability_map = reliability_map.clamp(0.0, 1.0)
+		out, effective_reliability, texture_weakness = self.refine_with_reliability(desc, geo_feat, reliability_map)
+		aux = {
+			'effective_reliability_map': effective_reliability,
+			'texture_weakness_map': texture_weakness,
+		}
+		return out, reliability_map, aux
+
+	def _texture_weakness(self, desc: torch.Tensor) -> torch.Tensor:
+		"""Estimate where visual evidence is weak using local descriptor variance."""
+		desc_map = desc.permute(0, 3, 1, 2)
+		desc_energy = desc_map.pow(2).mean(dim=1, keepdim=True)
+		k = self.texture_kernel_size
+		local_mean = F.avg_pool2d(desc_energy, kernel_size=k, stride=1, padding=k // 2)
+		local_var = F.avg_pool2d((desc_energy - local_mean).pow(2), kernel_size=k, stride=1, padding=k // 2)
+		local_std = local_var.clamp_min(1e-8).sqrt()
+		baseline = local_std.mean(dim=(2, 3), keepdim=True).detach()
+		texture_conf = torch.sigmoid(self.texture_temperature * (local_std - baseline))
+		return (1.0 - texture_conf).clamp(0.0, 1.0)
+
+	def refine_with_reliability(self, desc: torch.Tensor, geo_feat: torch.Tensor, reliability_map: torch.Tensor):
+		"""Apply a small geometry-conditioned residual under reliability control."""
+		effective_reliability = reliability_map
+		texture_weakness = None
+		if self.complementarity_enabled:
+			texture_weakness = self._texture_weakness(desc)
+			effective_reliability = reliability_map * (
+				self.complementarity_floor + (1.0 - self.complementarity_floor) * texture_weakness
+			)
+		gate = self.gate_floor + (1.0 - self.gate_floor) * effective_reliability
 
 		film = self.film_gen(geo_feat)
 		scale, shift = film.chunk(2, dim=1)
@@ -677,11 +814,11 @@ class GCDR(nn.Module):
 		residual = desc * scale + shift
 		if self.residual_clip > 0:
 			residual = residual.clamp(min=-self.residual_clip, max=self.residual_clip)
-		residual_gate = self.residual_gate_floor + (1.0 - self.residual_gate_floor) * reliability_map
+		residual_gate = self.residual_gate_floor + (1.0 - self.residual_gate_floor) * effective_reliability
 		residual_gate = residual_gate.permute(0, 2, 3, 1)
 		out = desc + (self.residual_gain * residual_gate) * residual
 		out = self.norm(out)
-		return out, reliability_map
+		return out, effective_reliability, texture_weakness
 
 # --------- Linear Attention with Local Correlation & Domain-Dynamic Adaptation ---------
 # 负责空间上下文传播和局部相关性增强
@@ -897,18 +1034,18 @@ class AFTBlock(nn.Module):
 
 	def __init__(self, feature_dim: int, model_config: Optional[dict] = None, dropout: bool = False, p: float = 0.1):
 		super().__init__()
-		aft_cfg = dict((model_config or {}).get('aft_config', {}))
+		aft_cfg = dict((model_config or {})['aft_config'])
 		self.attn = AFTAttention(
 			feature_dim,
-			num_groups=int(aft_cfg.get('num_groups', 4)),
+			num_groups=int(aft_cfg['num_groups']),
 			dropout=dropout,
 			p=p,
-			local_kernel_sizes=tuple(aft_cfg.get('local_kernel_sizes', (3, 5, 7))),
-			domain_adapt=bool(aft_cfg.get('domain_adapt', True)),
-			temperature_min=float(aft_cfg.get('temperature_min', 0.70)),
-			temperature_max=float(aft_cfg.get('temperature_max', 1.60)),
-			local_base_gain=float(aft_cfg.get('local_base_gain', 1.0)),
-			corr_base_gain=float(aft_cfg.get('corr_base_gain', 0.5)),
+			local_kernel_sizes=tuple(aft_cfg['local_kernel_sizes']),
+			domain_adapt=bool(aft_cfg['domain_adapt']),
+			temperature_min=float(aft_cfg['temperature_min']),
+			temperature_max=float(aft_cfg['temperature_max']),
+			local_base_gain=float(aft_cfg['local_base_gain']),
+			corr_base_gain=float(aft_cfg['corr_base_gain']),
 		)
 		self.ffn = FeedForwardNetwork(feature_dim, dropout=dropout, p=p)
 
@@ -943,7 +1080,7 @@ class FeatureBooster(nn.Module):
 	def __init__(self, model_config, dropout=False, p=0.1):
 		super().__init__()
 		self.model_config = model_config
-		self.geo_preprocess_mode = self.model_config.get('geo_preprocess_mode', 'unfold')
+		self.geo_preprocess_mode = self.model_config['geo_preprocess_mode']
 		self.use_dropout = dropout
 		self.dropout = nn.Dropout(p=p)
 
@@ -954,9 +1091,12 @@ class FeatureBooster(nn.Module):
 		# Geometric features setup
 		self.geo_raw_dims = {
 			'depth': 1,
+			'normal': 3,
 			'gradients': 5,
 			'curvatures': 1,
 		}
+		if bool(self.model_config['geometric_features']['normal']):
+			self.geo_raw_dims['gradients'] = 2
 		self.geo_encoders = nn.ModuleDict()
 		self.geo_branch_gates = nn.ModuleDict()
 		self.geo_specs = []
@@ -966,6 +1106,7 @@ class FeatureBooster(nn.Module):
 		# Mainline gradients are [dx, dy, normal_x, normal_y, normal_z].
 		features_map = [
 			('depth', 'depth_encoder'),
+			('normal', 'normal_encoder'),
 			('gradients', 'gradient_encoder'),
 			('curvatures', 'curvature_encoder'),
 		]
@@ -975,16 +1116,17 @@ class FeatureBooster(nn.Module):
 		geo_token_mult = 64 if self.geo_preprocess_mode == 'unfold' else 1
 
 		for name, enc_key in features_map:
-			if geo_cfg[name]:
+			if bool(geo_cfg[name]):
 				input_dim = self.geo_raw_dims[name] * geo_token_mult
 
 				# Each geometry branch is encoded independently to descriptor_dim.
 				# The branch gate below suppresses unreliable or low-information
 				# branches on a per-image basis before summing them.
+				encoder_layers = self.model_config[enc_key]
 				self.geo_encoders[name] = GeometricEncoder(
 					input_dim,
 					self.model_config['descriptor_dim'], # Target dimension
-					self.model_config[enc_key],
+					encoder_layers,
 					dropout=dropout
 				)
 				gate_hidden = max(8, input_dim // 8)
@@ -1005,16 +1147,16 @@ class FeatureBooster(nn.Module):
 				geo_input_dim += input_dim
 
 		total_geo_input_dim = geo_input_dim
-		gate_cfg = dict(self.model_config.get('geo_reliability_gate', {}))
+		gate_cfg = dict(self.model_config['geo_reliability_gate'])
 		self.geo_reliability_gate = None
-		if bool(gate_cfg.get('enabled', False)) and total_geo_input_dim > 0:
+		if bool(gate_cfg['enabled']) and total_geo_input_dim > 0:
 			self.geo_reliability_gate = GeometryReliabilityGate(
 				geo_dim=total_geo_input_dim,
 				feature_dim=self.model_config['descriptor_dim'],
-				hidden_dim=int(gate_cfg.get('hidden_dim', 12)),
-				gate_floor=float(gate_cfg.get('gate_floor', 0.20)),
-				bias_init=float(gate_cfg.get('bias_init', 2.0)),
-				fusion_gain=float(gate_cfg.get('fusion_gain', 0.50)),
+				hidden_dim=int(gate_cfg['hidden_dim']),
+				gate_floor=float(gate_cfg['gate_floor']),
+				bias_init=float(gate_cfg['bias_init']),
+				fusion_gain=float(gate_cfg['fusion_gain']),
 			)
 
 		self.attn_proj = AttentionalNN(feature_dim=self.model_config['descriptor_dim'], layer_num=self.model_config['attention_layers'], model_config=self.model_config, dropout=dropout)
@@ -1033,26 +1175,30 @@ class FeatureBooster(nn.Module):
 		elif self.refiner_type == 'GCDR':
 			# GCDR inserts BEFORE AttentionalNN: geometry conditions descriptors
 			# early so attention builds on geometry-aware representations.
-			gcdr_cfg = dict(self.model_config.get('gcdr_config', {}))
+			gcdr_cfg = dict(self.model_config['gcdr_config'])
 			self.pre_attn_refiner = GCDR(
 				dim=self.model_config['descriptor_dim'],
 				geo_dim=total_geo_input_dim,
-				geo_compress=int(gcdr_cfg.get('geo_compress', 8)),
-				reliability_hidden=int(gcdr_cfg.get('reliability_hidden', 16)),
-				gate_floor=float(gcdr_cfg.get('gate_floor', 0.10)),
-				residual_gain=float(gcdr_cfg.get('residual_gain', 1.0)),
-				residual_gate_floor=float(gcdr_cfg.get('residual_gate_floor', 0.10)),
-				residual_clip=float(gcdr_cfg.get('residual_clip', 0.25)),
+				geo_compress=int(gcdr_cfg['geo_compress']),
+				reliability_hidden=int(gcdr_cfg['reliability_hidden']),
+				gate_floor=float(gcdr_cfg['gate_floor']),
+				residual_gain=float(gcdr_cfg['residual_gain']),
+				residual_gate_floor=float(gcdr_cfg['residual_gate_floor']),
+				residual_clip=float(gcdr_cfg['residual_clip']),
+				complementarity_enabled=bool(gcdr_cfg['complementarity_enabled']),
+				texture_kernel_size=int(gcdr_cfg['texture_kernel_size']),
+				texture_temperature=float(gcdr_cfg['texture_temperature']),
+				complementarity_floor=float(gcdr_cfg['complementarity_floor']),
 			)
 		else:
 			raise ValueError(
 				f"Unsupported REFINER_TYPE '{self.refiner_type}'. "
 				"Expected one of: 'None', 'GCDR'. "
-				"Check MODEL.REFINER_TYPE in src/config/config.py or your --config_file override."
+				"Check the frozen model contract in GeoFeatModel.py and ABLATION in config.py."
 			)
 
 	def validate_refiner_configuration(self):
-		refiner_type = str(self.model_config.get('refiner_type', 'None'))
+		refiner_type = str(self.model_config['refiner_type'])
 		if refiner_type == 'GCDR':
 			if self.pre_attn_refiner is None:
 				raise RuntimeError(
@@ -1091,6 +1237,7 @@ class FeatureBooster(nn.Module):
 		B, C, H, W = desc.shape
 		geo_reliability_map = None
 		geo_memory_reliability_map = None
+		gcdr_aux = {}
 
 		# Ensure geo_v matches desc spatial resolution
 		if geo_v is not None and (geo_v.shape[2] != H or geo_v.shape[3] != W):
@@ -1105,7 +1252,9 @@ class FeatureBooster(nn.Module):
 		if self.use_dropout:
 			d_encoded = self.dropout(d_encoded)
 
-		# 2. Geometric Feature Fusion
+		# 2. Geometry reliability estimation. Geometry encoders summarize 0D/1D/2D
+		# cues only to decide where enhancement is trustworthy; they no longer
+		# directly add geometry content into the descriptor stream.
 		if geo_v is not None and self.geo_specs:
 			if geo_v_lin is None:
 				raise RuntimeError("geo_v is provided but geo_v_lin is None")
@@ -1125,16 +1274,25 @@ class FeatureBooster(nn.Module):
 				geo_encoded_sum = self.dropout(geo_encoded_sum)
 
 			if self.geo_reliability_gate is not None:
-				geo_encoded_sum, geo_memory_reliability_map = self.geo_reliability_gate(geo_v, geo_encoded_sum)
+				geo_memory_reliability_map = self.geo_reliability_gate(geo_v, geo_encoded_sum)
 
-			fused_desc = d_encoded + geo_encoded_sum
+			fused_desc = d_encoded
 		else:
 			fused_desc = d_encoded
 
 		# 3. LiftFeat baseline path: no keypoint encoder injection
-		# GCDR: pre-attention geometric conditioning (operates in NHWC format)
+		# GCDR: pre-attention small residual correction (operates in NHWC format).
+		# When the geometry gate is available, it controls where/how much GCDR can
+		# modify descriptors.
 		if self.pre_attn_refiner is not None and geo_v is not None:
-			fused_desc, geo_reliability_map = self.pre_attn_refiner(fused_desc, geo_v)
+			if geo_memory_reliability_map is not None:
+				fused_desc, geo_reliability_map, gcdr_aux = self.pre_attn_refiner.forward_with_reliability(
+					fused_desc,
+					geo_v,
+					geo_memory_reliability_map,
+				)
+			else:
+				fused_desc, geo_reliability_map, gcdr_aux = self.pre_attn_refiner(fused_desc, geo_v)
 		desc = fused_desc
 
 		# 4. AFT descriptor context refinement
@@ -1161,6 +1319,15 @@ class FeatureBooster(nn.Module):
 			aux_outputs['geo_memory_reliability_map'] = geo_memory_reliability_map
 		if geo_reliability_map is not None:
 			aux_outputs['geo_reliability_map'] = geo_reliability_map
+		if geo_reliability_map is not None and geo_memory_reliability_map is not None:
+			aux_outputs['geo_joint_reliability_map'] = (geo_reliability_map * geo_memory_reliability_map).sqrt()
+		if gcdr_aux:
+			effective_reliability = gcdr_aux['effective_reliability_map']
+			texture_weakness = gcdr_aux['texture_weakness_map']
+			if effective_reliability is not None:
+				aux_outputs['geo_effective_reliability_map'] = effective_reliability
+			if texture_weakness is not None:
+				aux_outputs['texture_weakness_map'] = texture_weakness
 
 		return desc_map, repeatability_map, aux_outputs
 
@@ -1177,15 +1344,25 @@ class GeoFeatModel(nn.Module):
 	def __init__(self, model_config):
 		super().__init__()
 		self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		self.model_config = model_config
+		# Public config exposes only high-level options; internal architecture
+		# defaults remain private to this module.
+		from copy import deepcopy
+		self.model_config = deepcopy(FIXED_MODEL_CONFIG)
+		self.model_config.update(model_config)
+		self.model_config['geometric_features'] = dict(FIXED_MODEL_CONFIG['geometric_features'], **model_config['geometric_features'])
 		self.geo_config = self.model_config['geometric_features']
 
 		# Backbone extracts a three-level pyramid. Later fusion brings x4/x5 back
 		# to x3 resolution, so all heads predict on the same stride-8 grid.
 		self.backbone = self.model_config['backbone']
-		# Balanced compact backbone: keep the full model under 1M parameters while
-		# preserving enough mid-level capacity for stable keypoints/descriptors.
-		c1, c2, c3, c4, c5 = 20, 20, 40, 80, 96
+		# Balanced compact default keeps the full mainline under 1M parameters.
+		# Archived wider checkpoints can restore their original channels through
+		# model_config['backbone_channels'].
+		backbone_channels = self.model_config['backbone_channels']
+		if len(backbone_channels) != 5:
+			raise ValueError(f"backbone_channels must contain 5 integers, got {backbone_channels}")
+		c1, c2, c3, c4, c5 = [int(v) for v in backbone_channels]
+		head_in_channels = int(self.model_config['head_in_channels'])
 		if self.backbone == "Standard":
 			self.feature_extract = StandardBackbone(c1, c2, c3, c4, c5)
 		elif self.backbone == "RepVGG":
@@ -1199,28 +1376,36 @@ class GeoFeatModel(nn.Module):
 		self.upsample5 = UpsampleLayer(c5)
 
 		self.conv_fusion45 = nn.Conv2d(c5//2+c4,c4,kernel_size=3,stride=1,padding=1)
-		self.conv_fusion34 = nn.Conv2d(c4//2+c3,c3,kernel_size=3,stride=1,padding=1)
+		self.conv_fusion34 = nn.Conv2d(c4//2+c3,head_in_channels,kernel_size=3,stride=1,padding=1)
 
 		# Dense prediction heads on the fused stride-8 feature map.
 		self.keypoint_dim = self.model_config['keypoint_dim']
-		self.keypoint_head = KeypointHead(in_channels=c3, out_channels=self.keypoint_dim)
+		self.keypoint_head = KeypointHead(
+			in_channels=head_in_channels,
+			out_channels=self.keypoint_dim,
+			hidden_channels=self.model_config['keypoint_head_channels'],
+		)
 		# descriptor
 		self.descriptor_dim = self.model_config['descriptor_dim']
-		self.descriptor_head = DescriptorHead(in_channels=c3, out_channels=self.descriptor_dim)
+		self.descriptor_head = DescriptorHead(
+			in_channels=head_in_channels,
+			out_channels=self.descriptor_dim,
+			hidden_channels=self.model_config['descriptor_head_channels'],
+		)
 		# geometric features
-		self.geo_head = GeoHead(in_channels=c3, geo_cfg=self.geo_config)
+		self.geo_head = None if not any(bool(v) for k, v in self.geo_config.items() if k != 'normal') else GeoHead(in_channels=head_in_channels, geo_cfg=self.geo_config)
 		# # heatmap
 		# self.heatmap_head = HeatmapHead(in_channels=c3, mid_channels=c3,out_channels=1)
 
 		# repeatability_alpha blends detector logits with repeatability logits.
 		# Optional adaptive knobs are injected by wrapper/evaluation code.
 		self.repeatability_alpha = self.model_config['repeatability_alpha']
-		self.repeatability_adaptive_gamma = float(self.model_config.get('repeatability_adaptive_gamma', 0.0))
-		self.descriptor_confidence_gain = float(self.model_config.get('descriptor_confidence_gain', 0.0))
+		self.repeatability_adaptive_gamma = float(self.model_config['repeatability_adaptive_gamma'])
+		self.descriptor_confidence_gain = float(self.model_config['descriptor_confidence_gain'])
 		self.geo_preprocess_mode = self.model_config['geo_preprocess_mode']
 		self.repeatability_proj = nn.Conv2d(1, self.keypoint_dim, kernel_size=1, bias=True)
 
-		self.attn_fusion = FeatureBooster(model_config)
+		self.attn_fusion = FeatureBooster(self.model_config)
 		self.attn_fusion.validate_refiner_configuration()
 
 	def fuse_multi_features(self,x3,x4,x5):
@@ -1282,7 +1467,7 @@ class GeoFeatModel(nn.Module):
 		# descriptor
 		des_map = self.descriptor_head(x)
 		# geometry
-		geo_map = self.geo_head(x)
+		geo_map = self.geo_head(x) if self.geo_head is not None else None
 		# # heatmap
 		# heatmap = self.heatmap_head(x)
 
@@ -1306,21 +1491,23 @@ class GeoFeatModel(nn.Module):
 		# gradients, and curvatures. The legacy unfold path was designed to enrich
 		# depth-only geometry; with richer derivative geometry it can add redundant
 		# channels and noise.
-		if self.geo_preprocess_mode == 'unfold':
+		if geo_map is None:
+			processed_geo_map = None
+		elif self.geo_preprocess_mode == 'unfold':
 			# Legacy path: keep each 8x8 geometry patch as channels aligned to one
 			# descriptor cell. More expressive, but heavier and noisier.
-			geo_map = self._unfold2d(geo_map, ws=8)
+			processed_geo_map = self._unfold2d(geo_map, ws=8)
 		else:
 			# Mainline path: geometry derivatives are already semantically dense, so
 			# direct resizing is cheaper and avoids redundant patch channels.
-			geo_map = F.interpolate(
+			processed_geo_map = F.interpolate(
 				geo_map,
 				size=des_map.shape[-2:],
 				mode='bilinear',
 				align_corners=False,
 			)
 
-		descs_refine, repeatability_map, aux_outputs = self.attn_fusion(des_map, keypoint_map, geo_map)
+		descs_refine, repeatability_map, aux_outputs = self.attn_fusion(des_map, keypoint_map, processed_geo_map)
 
 		def _repeatability_confidence(rep_map, gamma):
 			"""Convert repeatability prediction into a confidence map for blending."""
@@ -1333,6 +1520,18 @@ class GeoFeatModel(nn.Module):
 			repeatability_map,
 			self.repeatability_adaptive_gamma,
 		)
+		geometry_keypoint_reliability = aux_outputs['geo_joint_reliability_map'] if 'geo_joint_reliability_map' in aux_outputs else None
+		if geometry_keypoint_reliability is None:
+			geometry_keypoint_reliability = aux_outputs['geo_reliability_map'] if 'geo_reliability_map' in aux_outputs else None
+		if geometry_keypoint_reliability is not None:
+			if geometry_keypoint_reliability.shape[-2:] != confidence_map.shape[-2:]:
+				geometry_keypoint_reliability = F.interpolate(
+					geometry_keypoint_reliability,
+					size=confidence_map.shape[-2:],
+					mode='bilinear',
+					align_corners=False,
+				)
+			confidence_map = confidence_map * geometry_keypoint_reliability.clamp(0.0, 1.0)
 
 		if self.descriptor_confidence_gain > 0:
 			# Optional inference-time safeguard: blend refined descriptors with raw
@@ -1355,6 +1554,8 @@ class GeoFeatModel(nn.Module):
 			aux_outputs = dict(aux_outputs)
 			aux_outputs['repeatability_map'] = repeatability_map
 			aux_outputs['repeatability_confidence_map'] = confidence_map
+			if geometry_keypoint_reliability is not None:
+				aux_outputs['geometry_keypoint_reliability_map'] = geometry_keypoint_reliability
 			aux_outputs['keypoint_logits_refined'] = keypoint_logits_refined
 			if return_refined_keypoints:
 				return descs_refine, keypoint_logits_refined, aux_outputs

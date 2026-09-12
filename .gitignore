@@ -13,10 +13,10 @@ logdir/
 
 # weights file
 weights/*
-weights_0430/*
 weights_0501/*
 weights_0520/*
 weights_0601/*
+weights_0830/*
 
 # onnx models
 *.onnx
@@ -32,7 +32,8 @@ results/
 LiftFeat/
 HS-FPN/
 xfeat/
-LoFTR
+LoFTR/
+EfficientLoFTR/
 
 # output file	
 output/
@@ -42,3 +43,5 @@ tools/
 
 docs/
 legacy/
+
+linux/

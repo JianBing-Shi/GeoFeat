@@ -21,23 +21,26 @@ parser=argparse.ArgumentParser(description='MegaDepth dataset evaluation script'
 parser.add_argument('--name',type=str,default='GeoFeat',help='experiment name')
 parser.add_argument('--gpu',type=str,default='0',help='GPU ID')
 parser.add_argument('--weights', type=str, required=True, help='Path to GeoFeat checkpoint (.pth)')
-parser.add_argument('--top_k', type=int, default=4096, help='Maximum number of detected keypoints to keep.')
-parser.add_argument('--detect-threshold', type=float, default=0.05, help='Keypoint detection threshold.')
-parser.add_argument('--nms-kernel-size', type=int, default=7, help='NMS kernel size for keypoint detection.')
-parser.add_argument('--match-min-cossim', type=float, default=0.1, help='Minimum cosine similarity for accepting a match.')
-parser.add_argument('--match-ratio-thresh', type=float, default=0.8, help='Lowe-style ratio threshold for match filtering.')
-parser.add_argument('--pose-epipolar-error', type=float, default=5.0, help='Epipolar error threshold passed to relative pose estimation.')
+parser.add_argument('--top_k', type=int, default=0, help='Maximum number of detected keypoints to keep; <=0 keeps all NMS keypoints.')
+parser.add_argument('--detect-threshold', type=float, default=0.1, help='Keypoint detection threshold.')
+parser.add_argument('--nms-kernel-size', type=int, default=5, help='NMS kernel size for keypoint detection.')
+parser.add_argument('--match-min-cossim', type=float, default=-1.0, help='Minimum cosine similarity for accepting a match; <=0 disables this filter.')
+parser.add_argument('--match-ratio-thresh', type=float, default=0.90, help='Lowe-style ratio threshold for match filtering; <=0 disables this filter.')
+parser.add_argument('--pose-epipolar-error', type=float, default=2.4, help='Epipolar error threshold passed to relative pose estimation.')
 parser.add_argument('--descriptor-source', type=str, default='refined', choices=['raw', 'refined'], help='Descriptor source used at evaluation time.')
 parser.add_argument('--keypoint-source', type=str, default='refined', choices=['raw', 'refined'], help='Keypoint heatmap source used at evaluation time.')
 parser.add_argument('--compare-sources', action='store_true', help='Evaluate all raw/refined descriptor-keypoint source combinations.')
 parser.add_argument('--preset', type=str, default='none', choices=['none', 'gcdr_noloss_auc5_boost'], help='Apply an evaluation preset before building the wrapper.')
 parser.add_argument('--save-json', type=str, default='', help='Optional path to save evaluation summaries as JSON.')
+parser.add_argument('--config_file', type=str, default='', help='Optional model config YAML. If set, evaluate weights with this current architecture instead of the checkpoint snapshot.')
+parser.add_argument('--max-pairs', type=int, default=0, help='Evaluate only the first N pairs for quick debugging; 0 uses the full benchmark.')
 args=parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
 sys.path.append(os.path.join(os.path.dirname(__file__),'../'))
 from src.utils.geofeat_wrapper import GeoFeat, load_model_config_for_weights
+from src.config.config import get_cfg_defaults, get_model_config
 from evaluation.eval_utils import *
 
 from torch.utils.data import Dataset,DataLoader
@@ -99,7 +102,7 @@ class MegaDepth1500(Dataset):
 
 def apply_eval_preset(parsed_args):
     if parsed_args.preset == 'gcdr_noloss_auc5_boost':
-        if parsed_args.top_k == 4096:
+        if parsed_args.top_k == 0:
             parsed_args.top_k = 4096
         if parsed_args.detect_threshold == 0.05:
             parsed_args.detect_threshold = 0.03
@@ -142,9 +145,18 @@ def evaluate_once(dataset, weights, model_config, descriptor_source, keypoint_so
 if __name__ == "__main__":
     args = apply_eval_preset(args)
     weights = os.path.abspath(args.weights)
-    model_config = load_model_config_for_weights(weights)
+    if args.config_file:
+        cfg = get_cfg_defaults()
+        cfg.merge_from_file(args.config_file)
+        model_config = get_model_config(cfg)
+        print(f"Using override model config: {os.path.abspath(args.config_file)}")
+        print("Checkpoint weights will be loaded with relaxed shape-compatible matching.")
+    else:
+        model_config = load_model_config_for_weights(weights)
     
     dataset = MegaDepth1500(json_file = DATASET_JSON, root_dir = DATASET_ROOT)
+    if args.max_pairs > 0:
+        dataset.data = dataset.data[:args.max_pairs]
     cur_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     source_pairs = [(args.descriptor_source, args.keypoint_source)]

@@ -1,1 +1,0 @@
-global_step,loss,loss_descs,acc_coarse,loss_fb_descs,acc_fb_coarse,loss_kpts,loss_kpts_raw,loss_kpts_refined,loss_reliability,kpt_raw_weight,kpt_refined_weight,loss_depths,loss_normals,loss_gradients,loss_curvature,total_pos,lr,forward_cost

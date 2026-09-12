@@ -3,7 +3,6 @@
 	training script
 """
 
-import argparse
 import os
 import time
 import sys
@@ -13,59 +12,12 @@ from typing import cast
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.config.config import get_cfg_defaults, get_data_config, get_model_config
-
-def parse_arguments():
-	parser = argparse.ArgumentParser(description="GeoFeat training script.")
-	parser.add_argument('--name', type=str, default='GeoFeat', help='set process name')
-	parser.add_argument('--config_file', type=str, default='',
-						help='Optional YAML config path merged on top of default config.')
-	parser.add_argument('--init_weights', type=str, default='',
-						help='Optional checkpoint path used to initialize model weights before training.')
-
-	# training setting
-	# 保存权重
-	parser.add_argument('--ckpt_save_path', type=str, default='weights',
-						help='Path to save the checkpoints.')
-	# 训练步数
-	parser.add_argument('--n_steps', type=int, default=160_000,
-						help='Number of training steps. Default is 160000.')
-	# 学习率
-	parser.add_argument('--lr', type=float, default=3e-4,
-						help='Learning rate. Default is 0.0003.')
-	# 学习率衰减
-	parser.add_argument('--gamma_steplr', type=float, default=0.5,
-						help='Gamma value for StepLR scheduler. Default is 0.5.')
-	# 训练尺寸
-	parser.add_argument('--training_res', type=lambda s: tuple(map(int, s.split(','))),
-						default=(800, 600), help='Training resolution as width,height. Default is (800, 600).')
-	# 训练设备
-	parser.add_argument('--device_num', type=str, default='cuda',
-						help='Device number to use for training. Default is "cuda:0".')
-	
-	# 重复性权重调整
-	parser.add_argument('--use_dual_kpt_loss', action='store_true',
-						help='If set, use dual keypoint loss for training.')
-
-	# debug模式，快速验证流程(创建虚拟数据集)
-	parser.add_argument('--dry_run', action='store_true',
-						help='If set, perform a dry run training with a mini-batch for sanity check.')
-	# 每多少步保存权重
-	parser.add_argument('--save_ckpt_every', type=int, default=1000,
-						help='Save checkpoints every N steps. Default is 1000.')
-
-	# Status 监控参数
-	parser.add_argument('--log_interval', type=int, default=1000, help='控制台指标刷新步频(平均)')
-	parser.add_argument('--status_interval', type=int, default=0, help='status.txt 写入步频 (0=跟随log_interval)')
-	
-	# 训练目录管理
-	parser.add_argument('--max_runs', type=int, default=30, help='只保留最近 N 次训练目录 (按创建时间)')
-
-	args = parser.parse_args()
-
-	return args
-
-args = parse_arguments()
+from src.config.config import (
+	get_cfg_defaults,
+	get_data_config,
+	get_model_config,
+	get_train_config,
+)
 
 import torch
 from torch import nn
@@ -77,14 +29,12 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import tqdm
 import glob
-import json
 import sys
 import os
 
 from model.GeoFeatModel import GeoFeatModel
 from model.GeometricExtractor import GeometricExtractor
-from loss.loss import GeoFeatLoss
-# from model.interpolator import InterpolateSparse2d
+from loss.loss import GeoFeatLoss, get_loss_config
 from utils.depth_anything_wrapper import DepthAnythingExtractor
 from utils.alike_wrapper import ALikeExtractor
 
@@ -97,24 +47,23 @@ import setproctitle
 
 class Trainer():
 	def __init__(self, 
-				data_config, model_config,
+				data_config, model_config, train_config=None,
 				model_name='GeoFeat',
 				ckpt_save_path="./weights",
-				init_weights='',
-				n_steps=30_000,
+				n_steps=160_000,
 				save_ckpt_every=1000,
 				lr=3e-4, gamma_steplr=0.5,
-				training_res=(800, 640), device_num="cuda:0",
+				training_res=(800, 640), 
+				device_num="cuda:0",
 				use_dual_kpt_loss=False,
 				dry_run=False,
-				log_interval=1000,
-				status_interval=0,
-				max_runs=20
+				max_runs=10
 				):
 		
 		# Store configs
 		self.data_config = data_config
 		self.model_config = model_config
+		self.train_config = dict(train_config or {})
 		self.use_dual_kpt_loss = bool(use_dual_kpt_loss)
 		self.kpt_single_source = 'raw'
 		self.kpt_raw_weight_start = 0.8
@@ -139,17 +88,7 @@ class Trainer():
 
 		# training model - Pass model config to GeoFeatModel
 		self.net = GeoFeatModel(model_config=self.model_config).to(self.dev)
-		if init_weights:
-			ckpt_path = os.path.abspath(init_weights)
-			if not os.path.isfile(ckpt_path):
-				raise FileNotFoundError(f"init_weights not found: {ckpt_path}")
-			state = torch.load(ckpt_path, map_location=self.dev)
-			if isinstance(state, dict) and 'state_dict' in state and isinstance(state['state_dict'], dict):
-				state = state['state_dict']
-			missing, unexpected = self.net.load_state_dict(state, strict=False)
-			print(f"Loaded init weights from {ckpt_path}")
-			print(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
-		refiner_type = str(self.model_config.get('refiner_type', 'None'))
+		refiner_type = str(self.model_config['refiner_type'])
 		if refiner_type == 'GCDR':
 			if getattr(self.net.attn_fusion, 'pre_attn_refiner', None) is None:
 				raise RuntimeError(
@@ -159,35 +98,37 @@ class Trainer():
 		
 		# Extract geometric config (validated in __main__)
 		geo_config = self.model_config['geometric_features']
-		loss_cfg = dict(self.model_config.get('loss_config', {}))
+		loss_cfg = get_loss_config()
 		reliability_loss_weight = 0.0
 		if refiner_type == 'GCDR':
-			reliability_loss_weight = float(loss_cfg.get('reliability_loss_weight', 1.0))
+			reliability_loss_weight = float(loss_cfg['reliability_loss_weight'])
 
-		repeatability_loss_weight = float(loss_cfg.get('repeatability_loss_weight', 0.1))
+		repeatability_loss_weight = float(loss_cfg['repeatability_loss_weight'])
 
 		self.loss_fn = GeoFeatLoss(
 			self.dev, 
 			lam_descs=1, 
-			lam_fb_descs=3,       # 保持描述子权重
+			lam_fb_descs=3,
 			lam_kpts=2, 
 			lam_kpts_raw=5,
 			lam_heatmap=1,
 			lam_reliability=reliability_loss_weight,
 			lam_repeatability=repeatability_loss_weight,
-			lam_depth=float(loss_cfg.get('depth_weight', 1.0)),
-			lam_gradients=float(loss_cfg.get('gradient_weight', 2.0)),
-			lam_curvature=float(loss_cfg.get('curvature_weight', 1.0)),
-			lam_descriptor_protect=float(loss_cfg.get('descriptor_protect_weight', 0.0)),
-			lam_reliable_enhance=float(loss_cfg.get('reliable_enhance_weight', 0.0)),
-			lam_unreliable_suppress=float(loss_cfg.get('unreliable_suppress_weight', 0.0)),
-			reliable_enhance_margin=float(loss_cfg.get('reliable_enhance_margin', 0.02)),
-			reliable_enhance_threshold=float(loss_cfg.get('reliable_enhance_threshold', 0.60)),
-			reliable_enhance_quantile=float(loss_cfg.get('reliable_enhance_quantile', 0.50)),
-			unreliable_suppress_threshold=float(loss_cfg.get('unreliable_suppress_threshold', 0.45)),
-			unreliable_suppress_quantile=float(loss_cfg.get('unreliable_suppress_quantile', 0.25)),
-			reliability_consistency_weight=float(loss_cfg.get('reliability_consistency_weight', 0.25)),
-			reliability_target_scale=float(loss_cfg.get('reliability_target_scale', 6.0)),
+			lam_depth=float(loss_cfg['depth_weight']),
+			lam_gradients=float(loss_cfg['gradient_weight']),
+			lam_curvature=float(loss_cfg['curvature_weight']),
+			lam_descriptor_protect=float(loss_cfg['descriptor_protect_weight']),
+			lam_reliable_enhance=float(loss_cfg['reliable_enhance_weight']),
+			lam_unreliable_suppress=float(loss_cfg['unreliable_suppress_weight']),
+			reliable_enhance_margin=float(loss_cfg['reliable_enhance_margin']),
+			reliable_enhance_threshold=float(loss_cfg['reliable_enhance_threshold']),
+			reliable_enhance_quantile=float(loss_cfg['reliable_enhance_quantile']),
+			unreliable_suppress_threshold=float(loss_cfg['unreliable_suppress_threshold']),
+			unreliable_suppress_quantile=float(loss_cfg['unreliable_suppress_quantile']),
+			reliability_consistency_weight=float(loss_cfg['reliability_consistency_weight']),
+			reliability_target_scale=float(loss_cfg['reliability_target_scale']),
+			geo_loss_reliability_weighted=bool(loss_cfg['geo_loss_reliability_weighted']),
+			geo_loss_unreliable_floor=float(loss_cfg['geo_loss_unreliable_floor']),
 			geo_config=geo_config
 		)
 
@@ -203,7 +144,7 @@ class Trainer():
 		self.alike_net = ALikeExtractor('alike-t', self.dev)
 
 		#Setup optimizer # 设置优化器
-		self.steps = n_steps
+		self.steps = 1 if dry_run else n_steps
 		self.opt = optim.Adam(filter(lambda x: x.requires_grad, self.net.parameters()), lr=lr)
 		# 每 step_size 步 削减 按 gamma 比例, 减少学习率
 		self.scheduler = torch.optim.lr_scheduler.StepLR(self.opt, step_size=10_000, gamma=gamma_steplr)
@@ -220,12 +161,18 @@ class Trainer():
 				batch_size=self.coco_batch_size,
 				out_resolution=training_res,  # 输出分辨率
 				warp_resolution=training_res,  # 几何变换后的输出分辨率
-				sides_crop=0.1,  # 边缘裁剪比例
+				sides_crop=0.1,
 				max_num_imgs=3000,  # 最大训练图像数
 				num_test_imgs=5,  # 测试图像数
 				photometric=True,  # 启用光度增强
 				geometric=True,  # 启用几何增强
-				reload_step=4000  # 图像重载步频
+				reload_step=4000,
+				rotation_degrees=30.0, scale_min=0.35, scale_max=1.20,
+				brightness=0.15, contrast=0.15, saturation=0.15, hue=0.15,
+				gamma_min=1.0, gamma_max=1.0, gamma_probability=0.0,
+				equalize_probability=0.40, shadow_probability=0.40,
+				shadow_min_factor=0.25, gaussian_blur_probability=0.30,
+				noise_probability=0.50, noise_std=10.0 / 255.0,
 			)
 		##################### COCO END #######################
 
@@ -264,53 +211,19 @@ class Trainer():
 		self.model_name = model_name
 		self.ckpt_save_path = ckpt_save_path
 		self.save_ckpt_every = save_ckpt_every
-		self.kpt_ramp_steps = max(1, int(0.8 * n_steps))
+		configured_kpt_ramp = 40000
+		self.kpt_ramp_steps = max(1, configured_kpt_ramp if configured_kpt_ramp > 0 else int(0.8 * n_steps))
+		self.homography_difficulty_start = 0.10
+		self.homography_difficulty_end = 0.10
+		self.homography_ramp_steps = 1
+		self.tps_probability = 0.70
 		self.best_metric_name = 'acc_fb_coarse'
 
-		# 保存本次运行的配置快照，便于追溯训练超参与模型结构
-		config_snapshot = {
-			"timestamp": stamp,
-			"model_name": model_name,
-			"train_params": {
-				"n_steps": n_steps,
-				"save_ckpt_every": save_ckpt_every,
-				"lr": lr,
-				"gamma_steplr": gamma_steplr,
-				"training_res": list(training_res),
-				"device": str(self.dev),
-				"init_weights": str(init_weights) if init_weights else "",
-			},
-			"data_config": self.data_config,
-			"model_config": self.model_config,
-			"train_kpt_config": {
-				"use_dual_kpt_loss": self.use_dual_kpt_loss,
-				"kpt_single_source": self.kpt_single_source,
-				"kpt_raw_weight_start": self.kpt_raw_weight_start,
-				"kpt_raw_weight_end": self.kpt_raw_weight_end,
-				"kpt_refined_weight_start": self.kpt_refined_weight_start,
-				"kpt_refined_weight_end": self.kpt_refined_weight_end,
-				"kpt_ramp_steps": self.kpt_ramp_steps,
-				"kpt_step_clock": self.save_ckpt_every,
-			},
-			"checkpoint_policy": {
-				"best_metric": self.best_metric_name,
-			},
-		}
-		try:
-			with open(os.path.join(self.run_dir, 'config_snapshot.json'), 'w', encoding='utf-8') as f:
-				json.dump(config_snapshot, f, indent=2)
-		except Exception as e:
-			print(f"Warning: failed to save config snapshot: {e}")
-		
 		# 清理旧的训练目录
 		self._cleanup_old_runs(ckpt_save_path, model_name, max_runs=max_runs)
 
 		self.dry_run = dry_run
 		self.writer = SummaryWriter(logdir)
-		self.log_interval = log_interval
-
-		# status 相关初始化
-		self.status_every = status_interval if status_interval > 0 else log_interval
 		self.status_path = os.path.join(self.run_dir, 'status.txt')
 		
 		# 初始化status文件
@@ -334,10 +247,15 @@ class Trainer():
 
 		# Stage clock is aligned with checkpoint interval.
 		# First 80%: 0.8/0.2 -> 0.2/0.8 with stair steps.
-		# Last 20%: refined branch only.
+		# Last 20%: keep 0.2/0.8 instead of hard-switching to refined only.
+		# ALike/raw supervision stays as a weak regularizer while GeoFeat/refined
+		# keypoints become the main training signal.
 		ramp_end = self.kpt_ramp_steps
 		if global_step > ramp_end:
-			return 0.0, 1.0
+			raw_w = float(self.kpt_raw_weight_end)
+			refined_w = float(self.kpt_refined_weight_end)
+			s = max(raw_w + refined_w, 1e-6)
+			return raw_w / s, refined_w / s
 
 		step_clock = max(1, self.save_ckpt_every)
 		stage_idx = max(0, (global_step - 1) // step_clock)
@@ -349,6 +267,12 @@ class Trainer():
 
 		s = max(raw_w + refined_w, 1e-6)
 		return raw_w / s, refined_w / s
+
+	def _compute_homography_difficulty(self, global_step: int) -> float:
+		t = min(max(float(global_step), 0.0) / float(self.homography_ramp_steps), 1.0)
+		return self.homography_difficulty_start + t * (
+			self.homography_difficulty_end - self.homography_difficulty_start
+		)
 
 	def _cleanup_old_runs(self, base_dir: str, model_name: str, max_runs: int = 10):
 		"""保留最近 max_runs 个以 model_name_ 开头的运行目录, 其余删除."""
@@ -373,14 +297,19 @@ class Trainer():
 			print(f'[cleanup][warn] cleanup failed: {e}')
 
 	# 创建训练数据
-	def generate_train_data(self):
+	def generate_train_data(self, global_step: int):
 		imgs1_t,imgs2_t=[],[]
 		imgs1_np,imgs2_np=[],[]
 		# norms0,norms1=[],[]
 		positives_coarse=[]
 		
 		if self.use_coco:
-				coco_imgs1, coco_imgs2, H1, H2 = coco_wrapper.make_batch(self.augmentor, 0.1)
+				difficulty = self._compute_homography_difficulty(global_step)
+				coco_imgs1, coco_imgs2, H1, H2 = coco_wrapper.make_batch(
+					self.augmentor,
+					difficulty,
+					tps_probability=self.tps_probability,
+				)
 				h_coarse, w_coarse = coco_imgs1[0].shape[-2] // 8, coco_imgs1[0].shape[-1] // 8
 				_ , positives_coco_coarse = coco_wrapper.get_corresponding_pts(coco_imgs1, coco_imgs2, H1, H2, self.augmentor, h_coarse, w_coarse)
 				coco_imgs1=coco_imgs1.mean(1,keepdim=True);coco_imgs2=coco_imgs2.mean(1,keepdim=True)
@@ -423,7 +352,7 @@ class Trainer():
 			for i in range(self.steps):
 				global_step = i + 1
 				# import pdb;pdb.set_trace()
-				imgs1_t, imgs2_t, imgs1_np, imgs2_np, positives_coarse = self.generate_train_data()
+				imgs1_t, imgs2_t, imgs1_np, imgs2_np, positives_coarse = self.generate_train_data(global_step)
 
 				#Check if batch is corrupted with too few correspondences
 				# 检查匹配点是否过少
@@ -481,9 +410,13 @@ class Trainer():
 					
 					fb_feats1.append(fb_feat1);fb_feats2.append(fb_feat2)
 					kpt_maps1_refined.append(kpt_refined1);kpt_maps2_refined.append(kpt_refined2)
-					if 'geo_reliability_map' in aux1:
+					if 'geo_joint_reliability_map' in aux1:
+						geo_reliability1.append(aux1['geo_joint_reliability_map'])
+					elif 'geo_reliability_map' in aux1:
 						geo_reliability1.append(aux1['geo_reliability_map'])
-					if 'geo_reliability_map' in aux2:
+					if 'geo_joint_reliability_map' in aux2:
+						geo_reliability2.append(aux2['geo_joint_reliability_map'])
+					elif 'geo_reliability_map' in aux2:
 						geo_reliability2.append(aux2['geo_reliability_map'])
 					if 'repeatability_map' in aux1:
 						repeatability1.append(aux1['repeatability_map'])
@@ -551,21 +484,21 @@ class Trainer():
 				acc_fb_coarse = loss_info['acc_fb_coarse']
 				
 				loss_kpts = loss_info['loss_kpts']
-				loss_kpts_raw = loss_info.get('loss_kpts_raw', torch.tensor(0.0, device=self.dev))
-				loss_kpts_refined = loss_info.get('loss_kpts_refined', torch.tensor(0.0, device=self.dev))
-				loss_reliability = loss_info.get('loss_reliability', torch.tensor(0.0, device=self.dev))
-				loss_repeatability = loss_info.get('loss_repeatability', torch.tensor(0.0, device=self.dev))
-				loss_descriptor_protect = loss_info.get('loss_descriptor_protect', torch.tensor(0.0, device=self.dev))
-				loss_reliable_enhance = loss_info.get('loss_reliable_enhance', torch.tensor(0.0, device=self.dev))
-				loss_unreliable_suppress = loss_info.get('loss_unreliable_suppress', torch.tensor(0.0, device=self.dev))
-				reliable_enhance_rate = loss_info.get('reliable_enhance_rate', torch.tensor(0.0, device=self.dev))
-				reliable_region_ratio = loss_info.get('reliable_region_ratio', torch.tensor(0.0, device=self.dev))
-				reliable_mean_gain = loss_info.get('reliable_mean_gain', torch.tensor(0.0, device=self.dev))
-				unreliable_enhance_rate = loss_info.get('unreliable_enhance_rate', torch.tensor(0.0, device=self.dev))
-				unreliable_region_ratio = loss_info.get('unreliable_region_ratio', torch.tensor(0.0, device=self.dev))
-				unreliable_mean_gain = loss_info.get('unreliable_mean_gain', torch.tensor(0.0, device=self.dev))
-				kpt_raw_weight = float(loss_info.get('kpt_raw_weight', kpt_raw_weight))
-				kpt_refined_weight = float(loss_info.get('kpt_refined_weight', kpt_refined_weight))
+				loss_kpts_raw = loss_info['loss_kpts_raw']
+				loss_kpts_refined = loss_info['loss_kpts_refined']
+				loss_reliability = loss_info['loss_reliability']
+				loss_repeatability = loss_info['loss_repeatability']
+				loss_descriptor_protect = loss_info['loss_descriptor_protect']
+				loss_reliable_enhance = loss_info['loss_reliable_enhance']
+				loss_unreliable_suppress = loss_info['loss_unreliable_suppress']
+				reliable_enhance_rate = loss_info['reliable_enhance_rate']
+				reliable_region_ratio = loss_info['reliable_region_ratio']
+				reliable_mean_gain = loss_info['reliable_mean_gain']
+				unreliable_enhance_rate = loss_info['unreliable_enhance_rate']
+				unreliable_region_ratio = loss_info['unreliable_region_ratio']
+				unreliable_mean_gain = loss_info['unreliable_mean_gain']
+				kpt_raw_weight = float(loss_info['kpt_raw_weight'])
+				kpt_refined_weight = float(loss_info['kpt_refined_weight'])
 				acc_kpt = loss_info['acc_kpt']
 
 				loss_depths = loss_info['loss_depths']
@@ -575,7 +508,7 @@ class Trainer():
 				loss_items.append(loss_descs.unsqueeze(0))      # 描述子损失
 				loss_items.append(loss_fb_descs.unsqueeze(0))   # 增强描述子损失
 				loss_items.append(loss_kpts.unsqueeze(0))       # 关键点损失
-				if self.model_config.get('refiner_type') == 'GCDR':
+				if self.model_config['refiner_type'] == 'GCDR':
 					loss_items.append(loss_reliability.unsqueeze(0))
 					loss_items.append(loss_reliable_enhance.unsqueeze(0))
 					loss_items.append(loss_unreliable_suppress.unsqueeze(0))
@@ -611,6 +544,23 @@ class Trainer():
 					ckpt_path = os.path.join(self.ckpt_dir, f'{self.model_name}_step{global_step}.pth')
 					torch.save(self.net.state_dict(), ckpt_path)
 
+					# Save the best in-loop checkpoint separately because the training
+					# metric may deteriorate during the later part of a run. The metric
+					# is a training proxy and should still be confirmed on benchmarks.
+					metric_value = float(acc_fb_coarse)
+					if metric_value > best_metric:
+						best_metric = metric_value
+						best_ckpt_path = os.path.join(self.ckpt_dir, f'{self.model_name}_best.pth')
+						torch.save(self.net.state_dict(), best_ckpt_path)
+						best_info_path = os.path.join(self.ckpt_dir, f'{self.model_name}_best.txt')
+						with open(best_info_path, 'w', encoding='utf-8') as f:
+							f.write(f'global_step={global_step}\n')
+							f.write(f'{self.best_metric_name}={metric_value:.8f}\n')
+						print(
+							f'new best {self.best_metric_name}={metric_value:.6f} '
+							f'at step {global_step}'
+						)
+
 				# 打印训练过程(损失函数) - 使用 tqdm.write 分行输出详细信息，避免单行过长
 				pbar.set_description(f'Loss/total: {loss.item():.4f} Accuracy/acc_fb_coarse: {acc_fb_coarse:.3f}')
 				pbar.update(1)
@@ -620,35 +570,35 @@ class Trainer():
 				# pbar.update(5)：进度条前进 5 步
 				# 它不会影响你的训练逻辑，只是显示上的变化。
 
-				# Log metrics
-				# log文件
-				self.writer.add_scalar('Loss/total', loss.item(), global_step)
-				self.writer.add_scalar('Loss/descs', loss_descs.item(), global_step)
-				self.writer.add_scalar('Accuracy/acc_coarse', acc_coarse, global_step)
-				self.writer.add_scalar('Loss/fb_descs', loss_fb_descs.item(), global_step)
-				self.writer.add_scalar('Accuracy/acc_fb_coarse', acc_fb_coarse, global_step)
-				self.writer.add_scalar('Loss/kpts', loss_kpts.item(), global_step)
-				self.writer.add_scalar('Loss/kpts_raw', loss_kpts_raw.item(), global_step)
-				self.writer.add_scalar('Loss/kpts_refined', loss_kpts_refined.item(), global_step)
-				self.writer.add_scalar('Loss/reliability', loss_reliability.item(), global_step)
-				self.writer.add_scalar('Loss/repeatability', loss_repeatability.item(), global_step)
-				self.writer.add_scalar('Loss/descriptor_protect', loss_descriptor_protect.item(), global_step)
-				self.writer.add_scalar('Loss/reliable_enhance', loss_reliable_enhance.item(), global_step)
-				self.writer.add_scalar('Loss/unreliable_suppress', loss_unreliable_suppress.item(), global_step)
-				self.writer.add_scalar('Reliability/enhance_rate', reliable_enhance_rate.item(), global_step)
-				self.writer.add_scalar('Reliability/reliable_region_ratio', reliable_region_ratio.item(), global_step)
-				self.writer.add_scalar('Reliability/reliable_mean_gain', reliable_mean_gain.item(), global_step)
-				self.writer.add_scalar('Reliability/unreliable_enhance_rate', unreliable_enhance_rate.item(), global_step)
-				self.writer.add_scalar('Reliability/unreliable_region_ratio', unreliable_region_ratio.item(), global_step)
-				self.writer.add_scalar('Reliability/unreliable_mean_gain', unreliable_mean_gain.item(), global_step)
-				self.writer.add_scalar('Loss/kpt_raw_weight', kpt_raw_weight, global_step)
-				self.writer.add_scalar('Loss/kpt_refined_weight', kpt_refined_weight, global_step)
-				self.writer.add_scalar('Loss/depths', loss_depths.item(), global_step)
-				self.writer.add_scalar('Loss/gradients', loss_gradients.item(), global_step)
-				self.writer.add_scalar('Loss/curvature', loss_curvature.item(), global_step)
+				# Log metrics whenever a checkpoint is saved.
+				if global_step % self.save_ckpt_every == 0:
+					self.writer.add_scalar('Loss/total', loss.item(), global_step)
+					self.writer.add_scalar('Loss/descs', loss_descs.item(), global_step)
+					self.writer.add_scalar('Accuracy/acc_coarse', acc_coarse, global_step)
+					self.writer.add_scalar('Loss/fb_descs', loss_fb_descs.item(), global_step)
+					self.writer.add_scalar('Accuracy/acc_fb_coarse', acc_fb_coarse, global_step)
+					self.writer.add_scalar('Loss/kpts', loss_kpts.item(), global_step)
+					self.writer.add_scalar('Loss/kpts_raw', loss_kpts_raw.item(), global_step)
+					self.writer.add_scalar('Loss/kpts_refined', loss_kpts_refined.item(), global_step)
+					self.writer.add_scalar('Loss/reliability', loss_reliability.item(), global_step)
+					self.writer.add_scalar('Loss/repeatability', loss_repeatability.item(), global_step)
+					self.writer.add_scalar('Loss/descriptor_protect', loss_descriptor_protect.item(), global_step)
+					self.writer.add_scalar('Loss/reliable_enhance', loss_reliable_enhance.item(), global_step)
+					self.writer.add_scalar('Loss/unreliable_suppress', loss_unreliable_suppress.item(), global_step)
+					self.writer.add_scalar('Reliability/enhance_rate', reliable_enhance_rate.item(), global_step)
+					self.writer.add_scalar('Reliability/reliable_region_ratio', reliable_region_ratio.item(), global_step)
+					self.writer.add_scalar('Reliability/reliable_mean_gain', reliable_mean_gain.item(), global_step)
+					self.writer.add_scalar('Reliability/unreliable_enhance_rate', unreliable_enhance_rate.item(), global_step)
+					self.writer.add_scalar('Reliability/unreliable_region_ratio', unreliable_region_ratio.item(), global_step)
+					self.writer.add_scalar('Reliability/unreliable_mean_gain', unreliable_mean_gain.item(), global_step)
+					self.writer.add_scalar('Loss/kpt_raw_weight', kpt_raw_weight, global_step)
+					self.writer.add_scalar('Loss/kpt_refined_weight', kpt_refined_weight, global_step)
+					self.writer.add_scalar('Loss/depths', loss_depths.item(), global_step)
+					self.writer.add_scalar('Loss/gradients', loss_gradients.item(), global_step)
+					self.writer.add_scalar('Loss/curvature', loss_curvature.item(), global_step)
 				
 				# status.txt 写入
-				if global_step % self.status_every == 0:
+				if global_step % self.save_ckpt_every == 0:
 					total_pos = sum(len(p) for p in positives_coarse)
 					with open(self.status_path, 'a', encoding='utf-8') as f:
 						f.write(f"{global_step},{loss.item():.6f},"
@@ -665,84 +615,38 @@ class Trainer():
 
 
 if __name__ == '__main__':
-	setproctitle.setproctitle(args.name)
-
-	# Load configs from config.py (yacs) and adapt to Trainer expectations
 	cfg = get_cfg_defaults()
-	if args.config_file:
-		cfg.merge_from_file(args.config_file)
 
 	data_config = get_data_config(cfg)
-	
-	# Abort if all datasets are disabled
-	if not data_config['use_megadepth'] and not data_config['use_coco']:
-		print("Error: Both use_megadepth and use_coco are False. Enable at least one dataset to train.")
-		sys.exit(1)
-
-	# Abort if required dataset paths are missing when enabled
-	if data_config['use_megadepth'] and not data_config['megadepth_root_path']:
-		print("Error: MEGADEPTH_ROOT_PATH is empty in config.py while use_megadepth is True. Abort training.")
-		sys.exit(1)
-	if data_config['use_coco'] and not data_config['coco_root_path']:
-		print("Error: COCO_ROOT_PATH is empty in config.py while use_coco is True. Abort training.")
-		sys.exit(1)
-
-	use_dual_kpt_loss = bool(args.use_dual_kpt_loss or cfg.TRAIN.USE_DUAL_KPT_LOSS)
-
-
+	train_config = get_train_config(cfg)
 	model_config = get_model_config(cfg)
 
-	# GeoFeatModel will normalize key casing internally
-	if not model_config:
-		print("Error: MODEL section in config.py is empty. Abort training.")
-		sys.exit(1)
-
-	# Strict guard: when REFINER_TYPE is enabled, all mainline geometry groups must be on.
-	# Normal is merged into gradients as first-order geometry, so it is not a
-	# standalone required switch here.
-	refiner_type = model_config['refiner_type']
-	if refiner_type != 'None':
-		geo_cfg = model_config.get('geometric_features', {})
-		required_geo = ('depth', 'gradients', 'curvatures')
-		disabled_geo = [name for name in required_geo if not bool(geo_cfg.get(name, False))]
-		if disabled_geo:
-			print(
-				"Error: REFINER_TYPE is not 'None', but not all mainline geometric features are enabled. "
-				f"Disabled: {disabled_geo}. Please set DEPTH/GRADIENTS/CURVATURES all to True."
-			)
-			sys.exit(1)
+	setproctitle.setproctitle(train_config['model_name'])
 
 	# # Show loaded configs explicitly
 	# print("data_config:")
-	# print(json.dumps(data_config, indent=2))
-	# print("model_config:")
-	# print(json.dumps(model_config, indent=2))
-
 	trainer = Trainer(
 		# Configuration files
 		data_config=data_config,
 		model_config=model_config,
+		train_config=train_config,
 
-		# Training parameters from CLI args
-		model_name=args.name,
-		ckpt_save_path=args.ckpt_save_path,
-		init_weights=args.init_weights,
-		n_steps=args.n_steps,
-		save_ckpt_every=args.save_ckpt_every,
-		lr=args.lr,
-		gamma_steplr=args.gamma_steplr,
-		training_res=args.training_res,
-		device_num=args.device_num,
-		use_dual_kpt_loss=use_dual_kpt_loss,
-		dry_run=args.dry_run,
+		# Training parameters from config.py
+		model_name=train_config['model_name'],
+		ckpt_save_path=train_config['ckpt_save_path'],
+		n_steps=train_config['n_steps'],
+		save_ckpt_every=train_config['save_ckpt_every'],
+		lr=train_config['lr'],
+		gamma_steplr=train_config['gamma_steplr'],
+		training_res=train_config['training_res'],
+		device_num=train_config['device'],
+		use_dual_kpt_loss=train_config['use_dual_kpt_loss'],
+
+		# Smoke Test
+		dry_run=train_config['dry_run'],
 		
-		# Status monitoring parameters
-		log_interval=args.log_interval,
-		status_interval=args.status_interval,
-
 		# Training directory management
-		max_runs=args.max_runs
+		max_runs=train_config['max_runs']
 	)
 
-	#The most fun part
 	trainer.train()

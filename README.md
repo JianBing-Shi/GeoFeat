@@ -6,7 +6,7 @@
 
 > **GeoFeat** 是一个创新的局部特征描述子学习框架，通过融合多阶几何信息（深度、法向量、曲率）并结合 AFTAttention 机制，显著提升了图像匹配在复杂几何场景下的鲁棒性。
 
-默认的 DATASET 与 MODEL 配置集中在 [src/config/config.py](src/config/config.py)。日常训练可以直接编辑这个主配置文件；[src/config/experiments](src/config/experiments) 下的 YAML 仅作为在默认配置之上的快捷覆盖层，通过 `--config_file` 叠加使用。
+配置唯一入口是 [src/config/config.py](src/config/config.py)。训练脚本不再读取或合并 YAML；模型与损失的冻结契约位于 [src/model/GeoFeatModel.py](src/model/GeoFeatModel.py)，仅数据集、训练、增强及显式消融开关在 `config.py` 中调整。
 
 ## 当前主线
 
