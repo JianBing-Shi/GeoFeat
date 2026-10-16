@@ -368,25 +368,20 @@ class DepthAnythingExtractor(nn.Module):
         return depth_t
 
     @torch.inference_mode()
-    def extract(self, img, target_size=None, geometric_extractor=None):
+    def extract(self, img, geometric_extractor, target_size=None):
         """Extract compact 3D geometry from DAM depth.
 
         DAM outputs depth only. GeometricExtractor then computes:
         depth: 1 channel
-        gradients: 5 channels [dx, dy, normal_x, normal_y, normal_z]
-        curvatures: 1 channel mean curvature
+        gradients: 2 channels [dx, dy]
+        normals: 3 channels [normal_x, normal_y, normal_z]
+        curvatures: 2 channels [H, D], Hessian half-trace/gap proxies
         """
         depth_t = self.extract_depth(img, target_size=target_size)
         depth_bchw = depth_t.unsqueeze(0).unsqueeze(0)
 
-        if geometric_extractor is None:
-            from src.model.GeometricExtractor import GeometricExtractor
-            geometric_extractor = GeometricExtractor(
-                device=depth_t.device,
-                enable_depth_extractor=False,
-            ).to(depth_t.device)
-
-        geo = geometric_extractor(depth=depth_bchw, return_all=False)
+        # Keep depth available for target normalization even in branch ablations.
+        geo = geometric_extractor(depth=depth_bchw, return_all=True)
         return {name: value.detach() for name, value in geo.items()}
     
     
@@ -409,7 +404,7 @@ if __name__=="__main__":
         grad = geo["gradients"]
         curv = geo["curvatures"]
         
-        norm=grad[0, 2:5].permute(1, 2, 0).cpu().numpy()
+        norm=geo["normals"][0].permute(1, 2, 0).cpu().numpy()
         norm=(norm+1)/2*255
         norm=norm.astype(np.uint8)
         cv2.imwrite(os.path.join(os.path.dirname(__file__),"norm.png"),norm)
@@ -425,7 +420,7 @@ if __name__=="__main__":
         cv2.imwrite(os.path.join(os.path.dirname(__file__),"grad_y.png"),grad_y_u8)
         cv2.imwrite(os.path.join(os.path.dirname(__file__),"grad_mag.png"),grad_mag_u8)
 
-        # 曲率图可视化: 5通道(k1, k2, K, H, SI)
+        # Curvature channels: [H, D]; visualize H here.
         curv_np = curv[0, 0].detach().cpu().numpy()
         cv2.imwrite(os.path.join(os.path.dirname(__file__),"curv_mean.png"),to_uint8_map(curv_np))
 

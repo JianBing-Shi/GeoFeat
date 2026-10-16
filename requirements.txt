@@ -1,38 +1,47 @@
-# Core Deep Learning
-torch
-torchvision
-pytorch-lightning
-tensorboard
+# GeoFeat training and local evaluation dependencies
+# Official CUDA 12.6 wheel pair:
+#   torch==2.14.1+cu126
+#   torchvision==0.29.1+cu126
+# 	lightning==2.6.6
 
-# Numerical & Computer Vision
-numpy
-opencv-python
-scipy
-matplotlib
-scikit-image
-pillow
-tqdm
+# PyTorch stack
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# pip3 install lightning==2.6.6
 
-# Configuration & Utilities
-yacs
-setproctitle
-omegaconf
-addict
-h5py
-rich
-huggingface_hub
+# FLOPs profiling / Triton kernels.
+# Official Triton is available on Linux; Windows uses the compatible Windows wheel.
+triton==3.8.0
 
-# Geometry & Features (GeoFeat Specific)
-kornia
-einops
-torch-dct
-trimesh
-poselib
-pycolmap
+# Numerical and image processing
+numpy==1.26.4
+scipy==1.13.1
+opencv-python==4.10.0.84
+scikit-image==0.24.0
+Pillow==10.4.0
+matplotlib==3.9.2
+tqdm==4.66.5
+h5py==3.11.0
 
-# 3rd Party Dependencies (ALIKE, Depth-Anything)
-timm
-albumentations
-evo
-gradio  # For Depth-Anything-V2 demo app
-gradio_imageslider # For Depth-Anything-V2 demo app
+# Lightning training and configuration
+PyYAML==6.0.2
+yacs==0.1.8
+setproctitle==1.3.3
+omegaconf==2.3.0
+addict==2.4.0
+rich==13.9.2
+
+# GeoFeat model and augmentation
+kornia==0.7.3
+einops==0.8.0
+torch-dct==0.1.6
+timm==1.0.11
+albumentations==1.4.20
+
+# Geometry, local matching, and evaluation
+trimesh==4.5.1
+poselib==2.0.5
+pycolmap==3.13.0
+evo==1.29.0
+
+# Depth Anything 3 downloads model weights through Hugging Face.
+huggingface_hub==0.26.2

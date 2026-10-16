@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from model.GeometricExtractor import GeometricExtractor
+from src.model.GeometricExtractor import GeometricExtractor
 
 # Public loss defaults live with the loss implementation.  Training code can
 # import this mapping directly; model configuration no longer carries losses.
@@ -148,6 +148,7 @@ class GeoFeatLoss(nn.Module):
 	"""
 	def __init__(self,
 				device,
+				geo_config,
 				lam_descs=1,
 				lam_fb_descs=1,
 				lam_kpts=1,
@@ -170,8 +171,7 @@ class GeoFeatLoss(nn.Module):
 				reliability_target_scale=6.0,
 				geo_loss_reliability_weighted=True,
 				geo_loss_unreliable_floor=0.25,
-				depth_spvs=True, 
-				geo_config=None):
+				depth_spvs=True):
 		super().__init__()
 		
 		# loss parameters (损失函数权重参数)
@@ -198,7 +198,7 @@ class GeoFeatLoss(nn.Module):
 		self.reliability_target_scale = float(reliability_target_scale)
 		self.geo_loss_reliability_weighted = bool(geo_loss_reliability_weighted)
 		self.geo_loss_unreliable_floor = float(max(0.0, min(geo_loss_unreliable_floor, 1.0)))
-		self.geo_config = geo_config if geo_config is not None else {}
+		self.geo_config = geo_config
 		
 		# 当前批次损失值
 		self.loss_descs=0           # 描述子损失
@@ -231,6 +231,7 @@ class GeoFeatLoss(nn.Module):
 		# device
 		self.dev=device
 		self.curvature_computer = GeometricExtractor(
+			model_config={'geometric_features': self.geo_config},
 			device=device,
 			enable_depth_extractor=False,
 		).to(device)
@@ -258,17 +259,17 @@ class GeoFeatLoss(nn.Module):
 	
 	def compute_descriptors_loss(self,descs1,descs2,pts):
 		"""
-		Descriptor Loss (Log-Cosh Circle Loss)
+		Descriptor loss: dual-softmax on geometric correspondences, not teacher descriptors.
 		
 		功能:
-			计算描述子对（Pairs）之间的 Circle Loss，并同时返回粗匹配准确率和置信度矩阵。
+			计算几何对应点的双向匹配损失，并返回粗匹配准确率和置信度。
 			用于拉近所有正样本对（Matched Pairs）在特征空间的余弦距离，并推远负样本对（Unmatched Pairs）。
 			
 		过程:
 			1. 取出批次中对应的描述子 m1 和 m2。
 			2. 使用 m1 @ m2.T 构建相似度矩阵。
 			3. 对角线为正样本 (Similarity of Positive pairs, sp)，非对角线为负样本 (Similarity of Negative pairs, sn)。
-			4. 将 sp, sn 输入 LogCoshCircleLoss 计算每一行的 Circle Loss。
+			4. 使用双向 softmax 和负对数似然监督对应关系。
 			5. 同时使用 m1 @ m2.T 计算双重 Softmax 损失的 confidence (用于后续热力图/坐标监督)。
 		"""
 		loss=[]
@@ -281,7 +282,6 @@ class GeoFeatLoss(nn.Module):
 			m1=descs1[b,:,pts1[:,1].long(),pts1[:,0].long()].permute(1,0)
 			m2=descs2[b,:,pts2[:,1].long(),pts2[:,0].long()].permute(1,0)
 			
-			# --- New Logic: Log-Cosh Circle Loss ---
 			# m1, m2: (N, D)
 			# Normalize first
 			m1 = F.normalize(m1, p=2, dim=1)
@@ -292,8 +292,6 @@ class GeoFeatLoss(nn.Module):
 			temp = 10.0 # equivalent to 1/0.1
 			loss_per, conf_per = dual_softmax_loss(m1, m2, temp=temp)  # Use dual_softmax_loss like LiftFeat
 
-			# --- Old Logic Commented Out ---
-			# loss_per_circle = self.circle_loss(sp, sn) 
 			
 			loss.append(loss_per.unsqueeze(0))
 			conf_list.append(conf_per)
@@ -614,11 +612,14 @@ class GeoFeatLoss(nn.Module):
 			geo_dict['depth'] = geo_map[:, geo_idx:geo_idx+1, :, :]
 			geo_idx += 1
 		if self.geo_config['gradients']:
-			geo_dict['gradients'] = geo_map[:, geo_idx:geo_idx+5, :, :]
-			geo_idx += 5
+			geo_dict['gradients'] = geo_map[:, geo_idx:geo_idx+2, :, :]
+			geo_idx += 2
+		if self.geo_config['normals']:
+			geo_dict['normals'] = geo_map[:, geo_idx:geo_idx+3, :, :]
+			geo_idx += 3
 		if self.geo_config['curvatures']:
-			geo_dict['curvatures'] = geo_map[:, geo_idx:geo_idx+1, :, :]
-			geo_idx += 1
+			geo_dict['curvatures'] = geo_map[:, geo_idx:geo_idx+2, :, :]
+			geo_idx += 2
 		return geo_dict
 
 	def compute_geometric_loss(self, geo_features1, geo_features2, DA_depths1, DA_depths2, megadepth_batch_size, reliability1=None, reliability2=None):
@@ -634,7 +635,7 @@ class GeoFeatLoss(nn.Module):
 		包含:
 			- L_Depth: L1(MinMaxNorm(D_pred), MinMaxNorm(D_GT)) 最小化归一化深度的误差。
 			- L_Grad: L1(Grad(D_pred), Grad(D_GT)) 最小化深度的空间梯度差异。
-			- L_Curv: L1(Curv(D_pred), Curv(D_GT)) 最小化曲率（Mean/Gaussian/Principal Curvatures）差异。
+			- L_Curv: L1 loss on the compact depth-Hessian proxies [H, D].
 			
 		注意:
 			只在 MegaDepth 数据（带深度信息）上计算，且需进行 Min-Max 归一化以消除绝对尺度带来的歧义（Scale Ambiguity）。
@@ -724,9 +725,11 @@ class GeoFeatLoss(nn.Module):
 					}
 					if 'gradients' in target:
 						geo_target['gradients'] = resize_target(target['gradients'], size)
+					if 'normals' in target:
+						geo_target['normals'] = resize_target(target['normals'], size)
 					if 'curvatures' in target:
 						geo_target['curvatures'] = resize_target(target['curvatures'], size)
-					if 'gradients' not in geo_target or 'curvatures' not in geo_target:
+					if any(name not in geo_target for name in ('gradients', 'normals', 'curvatures')):
 						geo_target['derived'] = self.curvature_computer(geo_target['depth'], return_all=True)
 					return geo_target
 
@@ -760,44 +763,44 @@ class GeoFeatLoss(nn.Module):
 					loss_depth_list.append(l_d.unsqueeze(0))
 
 				# Compute geometry losses using the compact DAM-derived contract:
-				# depth + gradients(dx, dy, normal) + curvatures(mean_curv).
-				if self.geo_config['gradients'] or self.geo_config['curvatures']:
+				# depth + gradients(dx, dy) + normals(nx, ny, nz) + curvatures(H, D).
+				if self.geo_config['gradients'] or self.geo_config['normals'] or self.geo_config['curvatures']:
+					first_order_loss = torch.tensor(0.0, device=self.dev)
 					# Gradients
 					if self.geo_config['gradients']:
-						# Extract predicted first-order geometry:
-						# [grad_x, grad_y, normal_x, normal_y, normal_z].
 						pred_grad1 = cur_geo1['gradients'][b]
 						pred_grad2 = cur_geo2['gradients'][b]
-						if 'gradients' in target1:
-							target_grad1 = target1['gradients']
-							target_grad2 = target2['gradients']
-							t_grad_x1, t_grad_y1, t_normal1 = target_grad1[:, 0:1], target_grad1[:, 1:2], target_grad1[:, 2:5]
-							t_grad_x2, t_grad_y2, t_normal2 = target_grad2[:, 0:1], target_grad2[:, 1:2], target_grad2[:, 2:5]
-						else:
-							feat_target1 = target1['derived']
-							feat_target2 = target2['derived']
-							t_grad_x1, t_grad_y1, t_normal1 = feat_target1['grad_x'], feat_target1['grad_y'], feat_target1['normal']
-							t_grad_x2, t_grad_y2, t_normal2 = feat_target2['grad_x'], feat_target2['grad_y'], feat_target2['normal']
+						t_grad1 = target1['gradients'] if 'gradients' in target1 else target1['derived']['gradients']
+						t_grad2 = target2['gradients'] if 'gradients' in target2 else target2['derived']['gradients']
+						l_g = weighted_l1(pred_grad1.unsqueeze(0), t_grad1, rel_w1) + \
+									weighted_l1(pred_grad2.unsqueeze(0), t_grad2, rel_w2)
+						# A two-channel mean needs x2 to preserve the original dx + dy sum.
+						first_order_loss = first_order_loss + 2.0 * l_g
 
-						l_g = weighted_l1(pred_grad1[0:1].unsqueeze(0), t_grad_x1, rel_w1) + \
-									weighted_l1(pred_grad1[1:2].unsqueeze(0), t_grad_y1, rel_w1) + \
-									weighted_l1(pred_grad1[2:5].unsqueeze(0), t_normal1, rel_w1) + \
-									weighted_l1(pred_grad2[0:1].unsqueeze(0), t_grad_x2, rel_w2) + \
-									weighted_l1(pred_grad2[1:2].unsqueeze(0), t_grad_y2, rel_w2) + \
-									weighted_l1(pred_grad2[2:5].unsqueeze(0), t_normal2, rel_w2)
-						loss_grad_list.append(l_g.unsqueeze(0))
+					# Surface normals are encoded separately but retain the first-order loss weight.
+					if self.geo_config['normals']:
+						pred_normal1 = cur_geo1['normals'][b].unsqueeze(0)
+						pred_normal2 = cur_geo2['normals'][b].unsqueeze(0)
+						t_normal1 = target1['normals'] if 'normals' in target1 else target1['derived']['normals']
+						t_normal2 = target2['normals'] if 'normals' in target2 else target2['derived']['normals']
+						l_n = weighted_l1(pred_normal1, t_normal1, rel_w1) + \
+									weighted_l1(pred_normal2, t_normal2, rel_w2)
+						first_order_loss = first_order_loss + l_n
+
+					if self.geo_config['gradients'] or self.geo_config['normals']:
+						loss_grad_list.append(first_order_loss.unsqueeze(0))
 
 					# Curvatures
 					if self.geo_config['curvatures']:
-						# Extract predicted curvatures (only mean curvature H1)
-						pred_curv1 = cur_geo1['curvatures'][b]  # shape (1, H, W)
+						# Depth-Hessian proxies: half-trace H and half-eigenvalue-gap D.
+						pred_curv1 = cur_geo1['curvatures'][b]  # shape (2, H, W)
 						pred_curv2 = cur_geo2['curvatures'][b]
 						if 'curvatures' in target1:
 							t_curv1 = target1['curvatures']
 							t_curv2 = target2['curvatures']
 						else:
-							t_curv1 = target1['derived']['mean_curv']
-							t_curv2 = target2['derived']['mean_curv']
+							t_curv1 = target1['derived']['curvatures']
+							t_curv2 = target2['derived']['curvatures']
 
 						l_c = weighted_l1(pred_curv1.unsqueeze(0), t_curv1, rel_w1) + weighted_l1(pred_curv2.unsqueeze(0), t_curv2, rel_w2)
 						loss_curv_list.append(l_c.unsqueeze(0))
@@ -831,7 +834,7 @@ class GeoFeatLoss(nn.Module):
 		if isinstance(geo_features2, torch.Tensor):
 			geo_features2 = self._split_geo_features(geo_features2)
 
-		# import pdb;pdb.set_trace()
+		# Both descriptor branches always learn from the same geometric correspondences.
 		self.loss_descs,self.acc_coarse,conf_list=self.compute_descriptors_loss(descs1,descs2,pts)
 		self.loss_fb_descs,self.acc_fb_coarse,fb_conf_list=self.compute_descriptors_loss(fb_descs1,fb_descs2,pts)
 		if self.lam_descriptor_protect > 0:
@@ -883,7 +886,7 @@ class GeoFeatLoss(nn.Module):
 		else:
 			self.loss_repeatability = torch.tensor(0.0, device=self.dev)
 
-		# keypoint loss: dual-branch (raw+refined) with fallback to single-branch
+		# Both detection branches use ALIKE-T labels; only their loss weights change.
 		if refined_kpts1 is None:
 			refined_kpts1 = kpts1
 		if refined_kpts2 is None:
@@ -912,11 +915,10 @@ class GeoFeatLoss(nn.Module):
 				raw_w, refined_w = 1.0, 0.0
 				self.loss_kpts = scale * self.loss_kpts_raw
 		
-		# Standalone normal supervision has been merged into gradients:
-		# gradients = [dx, dy, normal_x, normal_y, normal_z].
+		# Normal supervision uses the same first-order weight as depth gradients.
 		self.loss_normals = torch.tensor(0.0, device=self.dev)
 
-		if self.lam_depth > 0 or self.lam_gradients > 0 or self.lam_curvature > 0:
+		if any(self.geo_config.values()) and (self.lam_depth > 0 or self.lam_gradients > 0 or self.lam_curvature > 0):
 			self.loss_depths, self.loss_gradients, self.loss_curvature = self.compute_geometric_loss(
 				geo_features1,
 				geo_features2,

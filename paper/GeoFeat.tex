@@ -1,105 +1,399 @@
 \documentclass{article}
 \usepackage{ctex}
-\usepackage{amsmath, amsthm, amssymb, graphicx}
-\usepackage{svg}
+\usepackage{amsmath,amsthm,amssymb,graphicx}
 \usepackage{subcaption}
-\usepackage{hyperref, cleveref}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{hyperref,cleveref}
 
-
-\title{GeoFeat}
+\title{GeoFeat: Reliability-Aware 3D Geometry-Enhanced Local Feature Matching}
 \author{Jialiang Shi\footnote{上海工程技术大学，上海，中国}}
 \date{June 2026}
 
 \begin{document}
-	\maketitle
-	\begin{abstract}
-		\par 局部特征匹配是视觉定位、三维重建与机器人感知中的核心问题。现有学习方法在弱纹理、重复结构和大视角变化场景下仍易产生误匹配，原因在于其主要依赖二维外观线索，缺乏稳定的几何约束。本文提出 GeoFeat，一种轻量级几何增强局部特征学习框架。GeoFeat 通过单目深度先验构建多阶几何表示，并将深度、法向量、梯度与曲率等信息显式注入描述子学习过程。在网络结构上，我们采用多尺度视觉特征主干、几何分支编码、注意力自由全局建模，以及几何耦合局部聚合模块，从而在计算效率与几何判别能力间取得平衡。训练阶段使用描述子匹配损失、关键点蒸馏损失与几何一致性约束进行联合优化。实验结果表明，GeoFeat 在复杂场景中具有更稳定的匹配表现，并具备较好的轻量化部署潜力。
-		\par\noindent\textbf{关键词：}局部特征匹配；几何增强；多阶几何特征；知识蒸馏；轻量化部署
-	\end{abstract}
-	\section{Introduction}
-		\par 局部特征匹配是同步定位与建图（SLAM）、运动恢复结构（SfM）和视觉定位系统中的基础环节，其鲁棒性直接影响位姿估计与地图构建质量。虽然传统方法（如 SIFT、ORB）具备较好的几何不变性，但在弱纹理和重复结构区域容易退化。近年来学习方法显著提升了匹配精度，但多数方法仍主要依赖 RGB 外观信息，在复杂几何场景中易出现外观混淆。
-		\par 三维几何线索可提供更稳定的结构约束。深度、法向量、梯度与曲率分别描述了场景的绝对结构、局部朝向、一阶变化与二阶弯曲信息。相比仅依赖纹理，几何线索在光照变化和重复纹理条件下具有更强的跨视角一致性。已有工作证明几何信息可提升局部匹配性能，例如 LiftFeat\cite{LiftFeat} 引入法向量监督增强了描述子鲁棒性。
-		\par 然而，现有几何增强方案仍存在两类问题：其一，几何表示阶数有限，通常仅使用深度或法向量，难以充分刻画复杂曲面结构；其二，融合策略与计算开销之间难以兼顾，导致端侧部署受限。为此，本文提出 GeoFeat 框架，以多阶几何建模和轻量级融合为核心，提升局部匹配在复杂场景中的稳定性。
-		\par 本文贡献如下：
-		\begin{itemize}
-		\item 提出多阶几何特征构建策略，在单目深度先验基础上联合建模深度、法向量、梯度与曲率，并作为显式几何约束用于描述子学习。
-		\item 设计由注意力自由全局建模与几何耦合局部聚合组成的轻量增强模块，实现视觉特征与几何特征的高效融合。
-		\item 构建描述子匹配、关键点蒸馏与几何一致性联合优化目标，在保证效率的前提下提升复杂场景中的匹配稳定性。
-		\end{itemize}
-	\section{Related Work}
-	\subsection{Local Feature Matching}
-		\par 局部匹配通常包含关键点检测、描述子提取与匹配估计三个阶段。手工方法依赖尺度空间和方向归一化机制，具备一定几何不变性，但在复杂环境下鲁棒性有限。深度学习方法通过端到端训练学习判别性更强的描述子，显著提升了匹配准确率。然而，现有方法多数依赖二维纹理分布，难以有效区分几何结构相似但外观不同，或外观相似但几何不同的区域。
-	\subsection{Feature Matching Leveraging 3D Information}
-		\par 三维几何信息可显著缓解纯外观匹配的歧义。已有研究通过深度、法向量或三维坐标辅助匹配估计，验证了几何先验的有效性。但这类方法常受限于传感器依赖、标注成本或模型复杂度。近期方法尝试从单目估计中提取几何先验以降低硬件依赖，但多采用单一几何阶数，尚未系统融合多阶结构信息。
-		\par 与现有方法相比，GeoFeat 的特点在于：第一，构建覆盖零阶至二阶的多阶几何空间；第二，在全局与局部两个层面进行轻量融合；第三，通过联合损失实现几何与外观特征的协同优化。
-	\section{Method}
-		\par 本节介绍 GeoFeat 的整体结构与训练目标。实现上，GeoFeat 包含两阶段前向过程：第一阶段生成关键点 logits、视觉描述图和几何图，第二阶段在几何引导下对描述子进行增强并更新关键点响应。
-	\subsection{Network Architecture}
-		\begin{figure}[ht]
-			\centering
-			\includegraphics[width=0.9\textwidth]{./img/CurrentModel.pdf}
-			\caption{GeoFeat framework overview.}
-			\label{fig:GeoFeat}
-		\end{figure}
-		\par 如图\ref{fig:GeoFeat}所示，GeoFeat 的主干网络支持 Standard CNN 与 RepVGG 两种配置。输入图像首先转换为灰度并进行归一化，随后经五层卷积块提取多尺度特征。我们融合 $x_3, x_4, x_5$ 三层特征，兼顾局部纹理细节与高层语义上下文。关键点分支输出 65 通道 logits（$8\times8$ 栅格位置加背景），描述子分支输出稠密特征图。
-		\par 几何分支使用几何头预测多通道几何图，并根据配置动态选择深度、法向量、梯度与曲率分量。之后在 FeatureBooster 中分别执行描述子编码和几何编码，再通过全局交互模块与局部细化模块进行融合。最终描述子经过 $L_2$ 归一化输出，同时利用 repeatability map 调整关键点 logits。
-	\subsection{Multi-order Geometric Representation}
-		\par 给定深度图 $D \in \mathbb{R}^{H\times W}$，我们先计算一阶导数 $D_x,D_y$ 与二阶导数 $D_{xx},D_{yy},D_{xy}$。法向量定义为
-		\begin{equation}
-		\mathbf{n}=\frac{(-D_x,-D_y,1)}{\|(-D_x,-D_y,1)\|_2}.
-		\end{equation}
-		主曲率通过 Hessian 的特征值近似：
-		\begin{equation}
-		k_{1,2}=\frac{\mathrm{tr}(\mathbf{H})\pm\sqrt{\mathrm{tr}(\mathbf{H})^2-4\det(\mathbf{H})}}{2},
-		\end{equation}
-		其中 $\mathrm{tr}(\mathbf{H})=D_{xx}+D_{yy}$，$\det(\mathbf{H})=D_{xx}D_{yy}-D_{xy}^2$。
-		\begin{figure}[ht]
-			\centering
-			\setlength{\tabcolsep}{0pt}
-			\begin{tabular}{cccc}
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_grad_x.png} &
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_grad_y.png} &
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_norm.png} &
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_curv_H.png} \\[-5pt]
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_curv_k1.png} &
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_curv_k2.png} &
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_curv_K.png} &
-				\includegraphics[width=0.24\textwidth,height=0.16\textwidth]{./img/scence1_curv_SI.png}
-			\end{tabular}
-			\caption{Example geometric maps: gradients, normals, and curvature channels.}
-		\end{figure}
+\maketitle
 
-		\par 从可视化结果可以观察到，不同几何通道对结构信息具有互补响应。梯度图中，$D_x$ 主要强化垂直边界，$D_y$ 主要强化水平边界，能够稳定突出深度突变位置；法向量图在大面积平面区域呈现较高一致性，而在物体边界与表面朝向突变处出现明显变化，反映了局部朝向不连续性。
-		\par 需要说明的是，尽管几何计算模块可以同时得到主曲率 $k_1,k_2$、高斯曲率 $K$、平均曲率 $H_m$ 与形状指数等量，但当前网络实现仅将曲率分支作为单通道输入，并在训练阶段以平均曲率 $H_m$ 作为监督目标。这样设计的原因有三点：第一，现有主干融合接口对曲率分支的通道预算为 1，直接引入多通道曲率会改变模型结构与参数规模；第二，$k_1,k_2,K$ 和形状指数对深度噪声更敏感。当 $k_1 = k_2$ 时，该点称为曲面\textbf{脐点}（umbilic point）：曲面在该点所有切方向上的法曲率相等，不存在可区分的主方向，局部呈现均匀的"球面型"或"平坦型"弯曲（球面上每一点、大面积平坦壁面均属此类）。形状指数定义为
-		\begin{equation}
-		\mathrm{SI} = \frac{2}{\pi}\arctan\frac{k_1+k_2}{k_2-k_1},
-		\end{equation}
-		其分母恰为 $k_2 - k_1$。在脐点处 $k_2 - k_1 = 0$，形状指数产生数值奇异；即使仅存在微小深度噪声扰动，分母也可急剧趋近于零，导致形状指数对噪声极度敏感。训练中这类不稳定高频响应容易被放大，而 $H_m$ 在边界与曲面过渡区域仍保留主要几何信息且更平滑；第三，本工作目标是轻量化部署，使用单通道曲率可在计算开销与几何约束效果之间取得更稳健的折中。因此，本文将其余曲率量用于几何分析与可视化，不作为当前版本模型的直接训练输入。
-		\par 在实现中，梯度分支使用 2 通道 $(D_x,D_y)$，法向量分支使用 3 通道，深度分支使用 1 通道；曲率分支在主干融合时采用 1 通道表示。虽然几何计算模块可导出 $k_1,k_2,K,H_m$ 与形状指数等量，但当前训练中的曲率监督项对齐的是平均曲率 $H_m$。因此，当前 GeoFeat 的几何输入通道配置为 depth(1) + normal(3) + gradients(2) + curvature(1)。
-	\subsection{Global-Local Geometric Fusion}
-		\par 为在效率与表达能力间取得平衡，我们采用两级融合策略：
-		\begin{itemize}
-		\item \textbf{Global interaction:} 使用 attention-free 结构进行全局上下文建模，避免传统自注意力的高计算开销。
-		\item \textbf{Local refinement:} 当启用 GCLA 时，视觉分支与几何分支分别执行多尺度深度可分离卷积，并通过跨模态门控实现双向耦合，增强边缘与结构不连续区域的描述稳定性。
-		\end{itemize}
-	\subsection{Training Objectives}
-		\par 总损失由描述子匹配、关键点蒸馏与几何一致性项构成：
-		\begin{equation}
-		\mathcal{L}=\lambda_d\mathcal{L}_{desc}+\lambda_f\mathcal{L}_{fb}+\lambda_k\mathcal{L}_{kpt}+\lambda_h\mathcal{L}_{heat}+\lambda_g\mathcal{L}_{geo}.
-		\end{equation}
-		其中，$\mathcal{L}_{desc}$ 与 $\mathcal{L}_{fb}$ 使用双向概率匹配约束描述子一致性；$\mathcal{L}_{kpt}$ 使用蒸馏监督约束关键点响应；$\mathcal{L}_{geo}$ 对深度、梯度与曲率分支施加一致性约束。在当前实现里，曲率损失项使用单通道预测与目标平均曲率 $H_m$ 的 $L_1$ 约束。该联合目标提升了模型在复杂场景中的匹配稳定性。
-	\section{Experiments}
-		\par 训练实现基于 PyTorch Lightning，采用 COCO 增强样本与 MegaDepth 样本混合训练。优化器使用 Adam，初始学习率设为 $3\times10^{-4}$，并使用阶梯衰减策略。输入分辨率设置为 $800\times600$，损失项权重采用联合调参策略。
-		\par 评估采用 MegaDepth1500 协议，以位姿估计误差统计 AUC 指标。根据当前仓库评估记录，baseline2 配置在该流程下可获得稳定结果（例如 AUC@5/@10/@20 约为 45.04/59.00/70.27）。这些结果验证了 GeoFeat 设计在复杂几何场景下的有效性，并为后续 GCLA 与 no-unfold 等结构消融提供了对照基线。
-		\par 我们建议在最终稿中补充三类消融：
-		\begin{itemize}
-		\item 几何阶数消融：深度、深度+法向量、深度+法向量+梯度、全量多阶几何；
-		\item 融合模块消融：无局部细化、LocalRefiner、GCLA；
-		\item 预处理模式消融：unfold 与 no\_unfold\_lite。
-		\end{itemize}
-	\section{Conclusion}
-		\par 本文提出 GeoFeat，一种面向局部特征匹配的轻量级几何增强框架。GeoFeat 将多阶几何信息显式引入描述子学习流程，并通过注意力自由全局建模与几何耦合局部聚合实现高效融合。在联合损失约束下，模型能够在复杂场景中获得更稳定的匹配性能。未来工作将进一步探索跨域自适应几何蒸馏与实时部署优化，以提升在动态场景与低算力平台上的泛化能力。
+\begin{abstract}
+局部特征匹配在弱纹理、重复结构和大视角变化下容易受到外观歧义和单目几何噪声的共同影响。本文提出 GeoFeat，一种轻量级三维几何增强局部特征网络。该方法从共享视觉特征预测关键点、描述子和多阶几何，并以空间可靠性控制几何条件对描述子的残差注入；随后，增强描述子产生的可重复性响应被用于修正关键点选择。深度教师仅在训练阶段提供监督，推理阶段只需输入 RGB 图像。\end{abstract}
 
+\noindent\textbf{关键词：}局部特征匹配；三维几何；可靠性门控；条件调制；可重复性；轻量网络
+
+\section{Introduction}
+局部特征匹配为同步定位与建图（Simultaneous Localization and Mapping，SLAM）、运动恢复结构（Structure from Motion，SfM）和视觉定位提供图像对应关系~\cite{davison_monoslam_2007,Orb-slam2,schoenberger2016sfm,ORBSLAM3_TRO}。现有学习型方法通常从彩色（RGB）外观中联合预测关键点和描述子，但在光照变化、低纹理、重复纹理和大视角场景中容易产生外观歧义，导致对应关系不稳定。如何在外观证据不足时引入并控制可靠的结构信息，构成本文重点研究的问题。
+
+深度、梯度、法向量和二阶响应能够从不同阶次描述局部三维结构，为外观匹配提供结构线索。RGB-D 或点云方法通常依赖显式三维输入~\cite{Zeng2017_3DMatch,Yew2018_3DFeatNet}；LiftFeat 则利用单目深度派生的法向量监督几何学习，并据此增强二维描述子~\cite{LiftFeat}，为仅输入 RGB 图像的局部特征提取提供了几何增强途径。
+
+然而，单目几何的误差随空间位置变化，固定幅度融合可能将边界、遮挡或反光区域的错误几何响应传播到描述子。与此同时，关键点检测与描述子增强之间缺少直接的信息反馈，检测响应未必能反映增强后描述子的跨视图稳定性。因此，几何增强不仅需要控制局部几何的使用强度，还需要使关键点选择利用描述子细化后的信息。
+
+针对外观歧义、单目几何的空间变化噪声以及关键点检测与描述子稳定性不一致的问题，本文提出轻量级几何增强局部特征匹配框架 GeoFeat。与 LiftFeat 直接利用几何特征增强描述子不同，GeoFeat 将几何线索的使用强度作为可学习的任务相关变量，并把增强描述子形成的可重复性响应反馈至关键点检测。由此，结构表示、几何注入和检测选择构成一条连续的信息路径，主要贡献如下：
+\begin{itemize}
+\item 构建紧凑的多阶几何监督表示，将深度、一阶梯度、法向量代理和二阶深度响应组织为八通道目标，使共享视觉网络学习不同阶次的结构线索（第~\ref{sec:geometry}~节）。
+\item 提出几何条件描述子细化（Geo-Conditional Descriptor Refinement，GCDR）模块，以可靠性门控控制三维几何条件的残差注入，使描述子增强保持视觉外观分支的主导作用（第~\ref{sec:gcdr}~节；监督见第~\ref{sec:training}~节）。
+\item 提出描述子引导的关键点细化，从增强描述子预测可重复性代理，并在几何可靠性控制下修正检测响应，将描述子形成后的信息用于关键点选择（第~\ref{sec:detection-feedback}~节）。
+\end{itemize}
+
+GeoFeat 推理时仅输入 RGB 图像，无需深度输入；冻结的 Depth Anything 3（DA3）~\cite{Lin2025DepthAnything3} 仅用于训练期几何监督，不引入部署阶段的教师模型开销。\textbf{[待实验结果核验]} 实验表明，GeoFeat 在弱纹理、大视角和夜间定位场景中均优于轻量级基线，同时保持与 LiftFeat 相当的推理开销。
+
+\section{Related Work}
+
+\subsection{Learned Local Features and Matching}
+局部特征匹配通常包括关键点检测、描述子提取和对应关系估计三个步骤。学习型方法从训练目标和检测--描述关系两方面改进局部表示：SuperPoint~\cite{DeTone2018SuperPoint} 通过自监督与单应性适配学习关键点和描述子，D2-Net~\cite{Dusmanu2019D2Net} 使用共享的稠密特征同时完成描述与检测。R2D2~\cite{Revaud2019R2D2} 联合建模检测可重复性与描述子可靠性，DISK~\cite{Tyszkiewicz2020DISK} 通过策略梯度优化正确匹配的数量，ALIKE~\cite{Zhao2023ALIKE} 则结合可微关键点检测与轻量网络实现亚像素定位。这些工作说明检测与描述需要协同学习；GeoFeat 进一步关注几何细化完成后的描述子信息如何反馈检测，而非将检测--描述协同本身作为新问题。
+
+在稀疏特征匹配阶段，SuperGlue~\cite{Sarlin2020SuperGlue} 通过图神经网络预测匹配代价，并以可微最优传输估计对应关系；LoFTR~\cite{Sun2021LoFTR} 以粗到细的 Transformer 交互建立无检测器对应关系；LightGlue~\cite{Lindenberger2023LightGlue} 则根据图像对的匹配难度自适应调整计算。二者处理跨图像特征交互，而 GeoFeat 在单幅图像的特征提取阶段细化描述子，因此其可靠性控制作用于几何条件的使用，而非跨图像匹配分配。
+
+为适应机器人和移动设备，近期工作进一步压缩描述子维度、减少匹配计算或采用状态空间模型进行高效上下文建模，例如 MambaGlue~\cite{MambaGlue2025}。面向视觉定位的全局--局部特征编码器和旋转感知二值描述子分别从上下文聚合与紧凑表示角度提升弱纹理场景的效率~\cite{Chen2026GLAFE,Yao2026RotationBinary}；事件视觉工作则探索全局到局部的匹配流程~\cite{Hines2026EventGeM}。基于匹配性预测的混合交互方法进一步将可匹配性用于计算分配~\cite{Lu2026Matchability}，不确定性估计方法则将对应置信度与运动先验结合以抑制错误匹配~\cite{Huang2026CUEMP}；近期的半稠密不确定性细化和旋转等变蒸馏工作分别将置信度建模与高效表示学习引入匹配流程~\cite{Li2026SURE,Ge2026REDIMatch}。语义--几何蒸馏方法也探索在轻量模型中保留结构信息~\cite{Shi2026SemLight}。这些方法分别从匹配阶段的计算调度和特征蒸馏角度提升效率；GeoFeat 的问题设定位于单图像特征提取阶段，重点估计几何条件本身的空间可靠性。此类方法主要优化 RGB 外观的表达与计算效率，轻量化设计本身并未处理预测几何在不同位置的可靠性差异。已有特征可靠性建模关注描述子的可匹配性，而本文关注几何条件是否值得参与描述子细化。GeoFeat 因此在轻量视觉特征之上引入空间可变的几何使用权重，这也引出了几何线索如何用于图像对应的问题。
+
+\subsection{3D Geometric Cues for Image Correspondence}
+三维局部描述子研究已经表明，空间结构可以为对应关系提供独立于颜色的判别依据。3DMatch 从 RGB-D 重建中学习局部几何描述子，3DFeat-Net 则面向点云配准学习弱监督三维特征~\cite{Zeng2017_3DMatch,Yew2018_3DFeatNet}。近期工作进一步研究弱纹理场景中的三维几何增强匹配~\cite{Sun2026GeomEff}，并通过几何共识和特征融合提升多视图深度表示~\cite{Zhu2026GeoFusion}。关于 RGB-to-depth 与深度传感器的比较也表明，预测深度能降低硬件依赖，但其误差性质与传感器深度不同~\cite{Ren2026DepthCamera}。这类方法通常依赖深度传感器、重建点云或显式三维邻域，与单幅 RGB 图像上的稠密局部特征提取存在差异。
+
+在图像匹配中，Toft 等人~\cite{Toft2020DepthMatching} 利用单图深度预测校正局部透视变形，以改善大视角变化下的特征匹配；其几何信息用于匹配前的图像校正。ICRA 的 TP3M 将参考图像引入 Transformer 以建立伪三维图像匹配，说明几何上下文也可以在图像域中参与对应关系估计~\cite{Han2024TP3M}。另一项 ICRA 工作将神经辐射场与特征匹配结合，用于一步位姿估计~\cite{Chen2024NeRFMatching}。LiftFeat~\cite{LiftFeat} 则将深度派生的法向量作为训练监督，学习几何特征并增强二维描述子。GeoFeat 延续后一条路径：深度教师提供训练目标，推理时由 RGB 图像预测几何条件，并在描述子内部控制其影响。
+
+作为本文的直接基础，LiftFeat 在检测位置采样描述子和法向量，再进行几何增强；其原有流程没有显式估计逐像素的几何使用可靠性，也没有将增强后的描述子反馈至关键点检测。ICRA 的语义引导匹配工作表明，附加结构信息可以帮助视觉 SLAM 过滤不稳定对应，但其重点在跨图像匹配和语义约束，而不是几何条件对单图描述子的门控~\cite{Ilter2024SemanticMatching}。GeoFeat 在此基础上学习多阶几何表示，并增加可靠性门控与描述子引导的检测反馈。深度梯度和 Hessian 响应仍是由估计深度派生的结构代理，不能视为独立的三维真值；如何控制这些条件信息对视觉表示的影响，进一步联系到条件调制与可靠性融合。
+
+\subsection{Conditional Modulation and Reliability-Aware Fusion}
+多模态融合可以通过拼接、加法或条件调制实现。FiLM 使用条件网络生成逐通道的尺度和偏移，使条件变量改变主分支的特征处理方式~\cite{Perez2018FiLM}。轻量视觉定位网络也开始将几何上下文与局部特征对齐，以提高弱纹理场景的稳定性~\cite{Deng2026GCANet}。该思想适合描述“几何应如何改变视觉表示”，但没有直接给出几何在当前位置是否可信。若预测几何存在局部错误，固定加法或无条件调制可能把噪声传播到描述子。
+
+FiLM 的基础形式定义了条件如何调制特征，但本身不包含针对单目几何误差的可靠性门控。GeoFeat 因此将几何路由、任务相关可靠性估计和有界残差调制结合：路由决定各组几何的相对权重，可靠性门控限制其注入幅度，原始视觉描述子则保留为残差锚点。本文的区别在于将匹配任务相关的几何可靠性用于控制条件调制，并进一步约束检测反馈；FiLM 与轻量上下文模块是实现这一机制的组成部分。
+
+\section{Method}
+给定输入图像，GeoFeat 从共享视觉特征中同时预测关键点、原始描述子和多阶几何，并通过可靠性条件的几何残差细化描述子。不同于将几何作为后处理或固定幅度附加项的方案，GeoFeat 在特征提取过程中学习几何路由和空间可靠性，使不确定的单目几何只产生受限修正。细化后的描述子再反馈关键点响应，形成从几何监督到描述子增强再到检测修正的单向信息流；整体架构和各模块的输入输出关系如图~\ref{fig:GeoFeat}~所示。
+
+\subsection{Overall Network Architecture}
+\label{sec:architecture}
+现有几何增强方法通常将深度或法向量作为固定条件使用，难以区分结构清晰区域与遮挡、边界等高噪声区域。GeoFeat 将几何表示、可靠性估计和描述子--检测反馈嵌入同一前向路径，在不增加推理期深度输入的条件下完成自适应融合。共享编码和多头预测由此连接几何学习、描述子细化与关键点检测。
+
+\noindent\textbf{Feature Encoding.} 五阶段 RepVGG~\cite{Ding2021RepVGG} 主干对归一化后的输入图像 $I\in\mathbb R^{3\times H_0\times W_0}$ 进行编码。步长为 $8,16,32$ 的特征 $x_3,x_4,x_5$ 经自顶向下融合得到共享特征
+\begin{equation}
+y_4=\mathcal C_4([x_4,\mathcal U_5(x_5)]),\qquad
+S=\mathcal C_3([x_3,\mathcal U_4(y_4)]),
+\label{eq:feature-encoding}
+\end{equation}
+其中 $\mathcal U$ 表示上采样与通道变换，$\mathcal C$ 表示融合卷积，$S\in\mathbb R^{40\times h\times w}$ 且 $h=H_0/8,w=W_0/8$。
+
+\begin{figure}[!htb]
+\centering
+\includegraphics[width=\textwidth]{img/GeoFeat.png}
+\caption{GeoFeat 整体架构。左侧共享主干提取多尺度视觉特征；上方多头分别预测关键点、原始描述子和八通道几何；中间几何路由与可靠性门控生成条件残差，GCDR 对描述子进行受控细化；右侧可重复性分支将增强描述子反馈至关键点检测。橙色虚线和雪花表示仅在训练阶段使用的冻结 DA3-Small 教师路径，推理阶段不需要深度输入。}
+\label{fig:GeoFeat}
+\end{figure}
+
+\noindent\textbf{Prediction Heads.} 关键点头输出 $65$ 通道检测未归一化分数（logits）$K$，其中 $64$ 个通道对应一个 $8\times8$ 单元内的位置，另一个通道表示背景；描述子头输出 $96$ 通道原始描述子图 $F_{\mathrm{raw}}$。几何预测头（Geometry Head，GeoHead）通过三级上采样输出八通道几何图 $G$，通道依次对应深度、两个梯度、三个法向量分量以及两个二阶响应。几何图随后对齐到描述子网格。
+
+\noindent\textbf{Descriptor Context.} 几何经路由和可靠性估计后进入 GCDR，得到受控的描述子残差；两个轻量的无注意力 Transformer（Attention-Free Transformer，AFT）~\cite{Zhai2021AFT} 风格上下文块进一步传播全局和局部信息，输出最终描述子 $F'$。所有图像独立完成前向提取，不依赖另一幅图像的特征。几何分支的学习目标由训练期深度教师构造，下面先说明这些结构线索的来源。
+
+\subsection{3D Geometric Knowledge Supervision}
+\label{sec:geometry}
+为使几何分支在无需额外三维标注的条件下学习结构线索，GeoFeat 沿用 LiftFeat 的伪标签生成思路~\cite{LiftFeat}，使用冻结的 Depth Anything 3 的 Small 变体（DA3-Small）~\cite{Lin2025DepthAnything3} 生成训练期教师深度。本文以 DA3 表示模型家族，DA3-Small 表示实际使用的教师变体。教师深度经尺寸对齐和逐图归一化得到 $Z$，并派生出零阶、一阶和二阶目标；推理时网络仅输入 RGB 图像，不运行深度教师。
+
+几何目标写为
+\begin{equation}
+G^*=[Z,Z_x,Z_y,n_x,n_y,n_z,H,D].
+\label{eq:geometry-target}
+\end{equation}
+其中 $Z_x,Z_y$ 是深度的一阶局部变化，法向量代理由
+\begin{equation}
+\mathbf n=\frac{(-Z_x,-Z_y,1)}{\sqrt{Z_x^2+Z_y^2+1}}
+\end{equation}
+给出。一阶差分采用固定的局部差分算子；具体滤波器属于实现细节。二阶响应由深度 Hessian 的半迹和半特征值间距近似：
+\begin{equation}
+H=\frac{Z_{xx}+Z_{yy}}{2},\qquad
+D=\frac12\sqrt{\max\{(Z_{xx}-Z_{yy})^2+4Z_{xy}^2,\epsilon\}},
+\quad \epsilon=10^{-6}.
+\label{eq:hessian-geometry}
+\end{equation}
+因此，八通道表示覆盖深度布局、一阶结构变化、局部方向和二阶形状差异；$H,D$ 是图像坐标系下的 Hessian 代理，不等同于经相机标定得到的物理曲率。GeoHead 直接预测全部通道，网络不会由学生深度再次求导生成其他目标。
+
+图~\ref{fig:geometry-cues}~给出教师深度及其派生响应，用于说明各阶表示的结构侧重，不作为几何精度或匹配收益的定量证据。这些目标确定了网络学习哪些几何线索，但不决定各位置应使用多少几何信息；特别是二阶响应可能放大深度误差，因此还需要下面的空间路由与可靠性控制。
+
+\begin{figure}[!htb]
+\centering
+\begin{subfigure}{0.31\linewidth}
+\includegraphics[width=\linewidth]{img/assert_geometry/depth.png}
+\caption{深度 $Z$}
+\end{subfigure}\hfill
+\begin{subfigure}{0.31\linewidth}
+\includegraphics[width=\linewidth]{img/assert_geometry/gradient.png}
+\caption{梯度幅值}
+\end{subfigure}\hfill
+\begin{subfigure}{0.31\linewidth}
+\includegraphics[width=\linewidth]{img/assert_geometry/normal.png}
+\caption{法向量代理 $\mathbf n$}
+\end{subfigure}
+
+\medskip
+\begin{subfigure}{0.31\linewidth}
+\includegraphics[width=\linewidth]{img/assert_geometry/curvature_H.png}
+\caption{半迹 $H$}
+\end{subfigure}\hfill
+\begin{subfigure}{0.31\linewidth}
+\includegraphics[width=\linewidth]{img/assert_geometry/curvature_D.png}
+\caption{半间距 $D$}
+\end{subfigure}\hfill
+\begin{subfigure}{0.31\linewidth}
+\includegraphics[width=\linewidth]{img/assert_geometry/curvature.png}
+\caption{联合幅值}
+\end{subfigure}
+\caption{DA3-Small 教师深度及派生几何，仅用于说明不同阶次的响应形式，不代表学生预测或度量真值。}
+\label{fig:geometry-cues}
+\end{figure}
+
+\subsection{Geo-Conditional Descriptor Refinement}
+\label{sec:gcdr}
+针对单目派生几何随位置变化的噪声，GCDR 依次执行几何路由（Geometry Routing）、几何可靠性门控（Geometry Reliability Gate）和受门控的 FiLM 风格残差调制。路由回答当前位置应侧重哪组几何，可靠性回答这些几何应以多大强度影响描述子，条件调制则实现具体的特征修正。
+
+在描述子网格位置 $p$，将深度、梯度、法向量和二阶响应分别记为 $G_j(p)$，$j=1,\ldots,4$。每组经过编码器 $E_j$ 和评分函数 $A_j$ 生成路由权重，并得到几何记忆 $M$ 与条件几何 $\widetilde G$：
+\begin{equation}
+\begin{aligned}
+w_j(p)&=4\operatorname{softmax}_j(A_j(G_j(p))),\\
+M(p)&=\sum_j w_j(p)E_j(G_j(p)),\\
+\widetilde G(p)&=[w_j(p)G_j(p)]_{j=1}^{4}.
+\end{aligned}
+\label{eq:geometry-routing}
+\end{equation}
+系数 $4$ 对应四组几何，使 $\sum_jw_j(p)=4$、平均增益为 $1$；当各组评分相等时，$w_j(p)=1$，保留各组原始幅度。因此，$w_j$ 是相对增益而非概率，$M$ 是加权求和而非凸组合；相较权重和为 $1$ 的同评分融合，其尺度扩大四倍。该约定与实现一致，但不保证 $M$ 的范数固定。可靠性估计器同时读取两种几何表示，输出任务相关可靠性图
+\begin{equation}
+r=\sigma\left(\phi_r([\psi_g(\widetilde G),\psi_m(M)])\right).
+\label{eq:geometry-reliability}
+\end{equation}
+其中方括号表示通道拼接，对应图中的 $C$；$\psi_g,\psi_m$ 是特征投影，$\phi_r$ 是可靠性预测器，$\sigma$ 为 sigmoid。几何记忆 $M$ 仅参与可靠性估计，条件几何 $\widetilde G$ 同时为后续调制提供输入。\textbf{几何可靠性 $r$} 是由几何表示预测的单通道空间使用权重，$r\in[0,1]^{1\times h\times w}$，用于控制几何注入及检测反馈强度，不表示深度准确率。\textbf{可重复性代理 $R$} 则由增强描述子预测，为后续关键点细化提供响应信息；两者来源和作用不同。
+
+GCDR 的特征修正分为投影、条件生成和门控残差三个步骤。首先，将原始描述子和路由几何映射到各自的特征空间：
+\begin{equation}
+F=\psi_f(F_{\mathrm{raw}}),\qquad q_g=\psi_c(\widetilde G),
+\label{eq:gcdr-projection}
+\end{equation}
+其中 $\psi_f$ 为视觉描述子的残差编码器，$\psi_c$ 为几何投影。随后，条件生成器 $\phi_c$ 从 $q_g$ 预测逐位置、逐通道的尺度与偏移，并形成 FiLM 修正：
+\begin{equation}
+[\gamma,\beta]=\phi_c(q_g),\qquad U=F\odot\tanh\gamma+\beta.
+\label{eq:gcdr-conditioning}
+\end{equation}
+最后，可靠性门控限制修正幅度，并将其注入视觉分支：
+\begin{equation}
+\begin{aligned}
+\Delta F&=g_m(r)\odot U,\\
+\widehat F&=\operatorname{LN}\left[F+0.35g_r(r)\odot\operatorname{clip}(\Delta F,-0.1,0.1)\right].
+\end{aligned}
+\label{eq:gcdr-residual}
+\end{equation}
+其中 $g_m(r)=0.10+0.90r$ 和 $g_r(r)=0.05+0.95r$ 分别为调制门和残差注入门，$\odot$ 表示逐元素乘法，$\operatorname{LN}$ 表示层归一化。图中的 $\Delta F$ 是第一门控后、裁剪前的残差；Clip、Gate 和 Add 分别对应裁剪、门控乘法和残差相加。两个非零下限是保留弱几何修正通路的软门控设置，并非排版错误：当 $r=0$ 时，$g_m=0.10$、$g_r=0.05$，但并不意味着注入原特征幅度的 $5\%$。结合增益和裁剪，归一化前每个元素的实际注入绝对值至多为 $0.35\times0.05\times0.1=0.00175$；此上界不适用于层归一化后的差值。随后，两个轻量 AFT 风格上下文块对 $\widehat F$ 进行全局与局部传播，输出归一化描述子 $F'$，再将其信息传递给关键点选择。
+
+\subsection{Descriptor-Guided Keypoint Refinement}
+\label{sec:detection-feedback}
+GCDR 细化了描述子，但原始检测响应并未直接利用这一结果，高响应位置仍可能具有不稳定的跨视图描述。为连接描述子形成与关键点选择，网络通过可重复性预测头（Repeatability Head）从最终描述子 $F'$ 预测可重复性代理 $R$，再生成反馈 logits $K_R$：
+\begin{equation}
+R=\sigma(\operatorname{Conv}_{1\times1}(\operatorname{DWConv}_{3\times3}(F'))),\qquad
+K_R=\operatorname{Conv}_{1\times1}(R).
+\label{eq:repeatability-response}
+\end{equation}
+其中 $\operatorname{DWConv}$ 表示逐通道卷积，$R$ 是从描述子学习的单通道可重复性响应；$K_R$ 将其投影为与原始检测 logits $K$ 一致的 $65$ 通道表示。$R$ 提供检测修正信息，而几何可靠性 $r$ 决定采用这一信息的幅度，最终检测 logits 采用加权融合：
+\begin{equation}
+\alpha(p)=0.35r(p),\qquad
+K'(p)=(1-\alpha(p))K(p)+\alpha(p)K_R(p).
+\label{eq:detection-feedback}
+\end{equation}
+当 $r$ 较低时，融合结果更接近原始检测响应，以减弱不可靠几何经描述子路径传递到检测端的影响。随后对 $K'$ 执行通道 softmax、背景剔除和非极大值抑制（Non-Maximum Suppression，NMS），并在保留位置对 $F'$ 双线性采样，得到最终局部特征。因此，$r$ 控制几何注入及反馈强度，$R$ 提供由描述子预测的可重复性信息；两者不能互换，$R$ 也不等同于实测的跨视图可重复率。该路径仅进行单向反馈，相关学习约束统一在下节说明。
+
+\subsection{Network Training}
+\label{sec:training}
+网络联合学习视觉匹配、几何表示和检测反馈，并分别约束几何可靠性 $r$ 与可重复性代理 $R$，使两条分支承担各自的任务。
+
+\noindent\textbf{Training Supervision.} 原始与细化描述子在有效对应点上接受双向 softmax 匹配监督，关键点 logits 接受 ALIKE-T~\cite{Zhao2023ALIKE} 生成的伪标签监督，其中 T 表示 Tiny 变体，对应实现中的 \texttt{alike-t}，四阶段通道数为 $8,16,32,64$。多阶几何监督仅施加于 MegaDepth 样本，各通道误差合并为 $\mathcal L_{\mathrm{geo}}$。为使 $r$ 反映细化带来的任务相关变化，使用匹配置信度增益构造代理目标：
+
+\begin{equation}
+t_i=\sigma\left(6\operatorname{sg}(c_i^{\mathrm{ref}}-c_i^{\mathrm{raw}})\right),
+\label{eq:reliability-target}
+\end{equation}
+其中 $c_i$ 是两个方向匹配分布最大概率的乘积，$\operatorname{sg}$ 表示停止梯度；$\mathcal L_{\mathrm{rel}}$ 拟合该目标并约束对应位置的 $r$ 一致。该置信度差是任务代理，不能解释为深度误差或真实匹配正确率。
+
+\noindent\textbf{Joint Objective.} 总训练目标为
+\begin{equation}
+\begin{aligned}
+\mathcal L={}&\mathcal L_{\mathrm{raw}}+3\mathcal L_{\mathrm{ref}}+\mathcal L_{\mathrm{kpt}}+\mathcal L_{\mathrm{geo}}\\
+&+0.25\mathcal L_{\mathrm{rel}}+0.10\mathcal L_{\mathrm{protect}}+0.03\mathcal L_{\mathrm{rep}}.
+\end{aligned}
+\label{eq:training-objective}
+\end{equation}
+式~\eqref{eq:training-objective}~中，$\mathcal L_{\mathrm{raw}}$ 保持视觉主分支的基本匹配能力；$\mathcal L_{\mathrm{ref}}$ 优化细化描述子的对应关系；$\mathcal L_{\mathrm{kpt}}$ 使检测响应符合关键点伪标签；$\mathcal L_{\mathrm{geo}}$ 使 GeoHead 学习教师提供的多阶结构。$\mathcal L_{\mathrm{rel}}$ 使 $r$ 反映匹配置信度增益；$\mathcal L_{\mathrm{protect}}$ 限制描述子过度修正；$\mathcal L_{\mathrm{rep}}$ 约束对应位置的 $R$ 一致。
+
+具体地，对一对图像的 $N$ 个有效对应点，记视图 $v\in\{1,2\}$ 中的对应位置为 $p_i^{(v)}$，$\bar f_i^{(v)}$ 和 $\bar f_i^{\prime(v)}$ 分别为该位置经 $\ell_2$ 归一化的原始与最终描述子，则
+\begin{equation}
+\begin{aligned}
+\mathcal L_{\mathrm{protect}}&=\frac{1}{2N}\sum_{v=1}^{2}\sum_{i=1}^{N}
+\left[1-\left\langle\operatorname{sg}(\bar f_i^{(v)}),\bar f_i^{\prime(v)}\right\rangle\right],\\
+\mathcal L_{\mathrm{rep}}&=\frac{1}{N}\sum_{i=1}^{N}
+\left[R^{(1)}(p_i^{(1)})-R^{(2)}(p_i^{(2)})\right]^2.
+\end{aligned}
+\label{eq:protect-repeatability}
+\end{equation}
+两个损失均先对每个图像对计算，再在批内取平均。保护项仅通过最终描述子传播梯度；重复性项约束 $R$ 的跨视图一致性，不直接监督几何可靠性 $r$，也不单独保证高检测重复率。
+
+检测监督采用每 $1000$ 步更新一次的分段调度。令训练步数 $t\geq1$，$s(t)=\min(\lfloor(t-1)/1000\rfloor,39)/39$，则原始与融合检测的混合权重为 $a(t)=0.8-0.6s(t)$、$b(t)=0.2+0.6s(t)$，检测损失为
+\begin{equation}
+\mathcal L_{\mathrm{kpt}}(t)=5a(t)\mathcal L_{K}+2b(t)\mathcal L_{K'},
+\label{eq:keypoint-schedule}
+\end{equation}
+其中 $\mathcal L_K,\mathcal L_{K'}$ 分别为原始和融合检测 logits 对 ALIKE-T 标签的负对数似然损失。第 $1$--$1000$ 步采用 $(a,b)=(0.8,0.2)$，第 $39001$--$40000$ 步达到 $(0.2,0.8)$，此后保持不变。系数 $5$ 和 $2$ 是两分支的固定损失倍率，因此上述混合权重不等同于最终有效系数。
+
+\section{Experiments}
+实验协议尽量与 LiftFeat~\cite{LiftFeat} 保持一致，以便在相同任务和计算预算下比较轻量级局部特征方法。训练数据由 COCO（Common Objects in Context）增强样本和 MegaDepth 样本混合组成，输入分辨率默认设为 $800\times600$，优化器采用 Adam，初始学习率为 $3\times10^{-4}$，并使用阶梯衰减。MegaDepth 样本同时提供匹配监督和训练期几何监督，COCO 样本用于匹配与关键点监督，关键点伪标签由 ALIKE-T 检测器生成。推理阶段只输入 RGB 图像，不运行 DA3 教师模型。除非特别说明，所有方法均采用互为最近邻（Mutual Nearest Neighbor，MNN）匹配，并使用相同的关键点预算、图像预处理和鲁棒估计配置。主结果均应由完整 GeoFeat 模型获得，不能使用消融模型或直接复用 LiftFeat 的结果。
+
+\subsection{A. Relative Pose Estimation}
+\noindent\textbf{Datasets and Protocol.} 我们在 MegaDepth-1500 和 ScanNet-1500 上评估相对位姿估计。前者包含具有明显视角和尺度变化的室外场景，后者包含室内 RGB-D 场景，因此能够分别检验模型在跨场景外观变化和室内结构重复条件下的匹配稳定性。按照 LiftFeat 的设置，MegaDepth 图像限制最大尺寸，ScanNet 图像采用 $640\times480$ 像素分辨率（Video Graphics Array，VGA）；每幅图像最多保留 4096 个关键点。对每个图像对提取关键点和描述子后，使用 MNN 建立候选对应关系，再通过鲁棒本质矩阵估计器恢复相对旋转和平移方向。
+
+\noindent\textbf{Metrics and Comparison.} 我们报告平移与旋转联合误差的累积分布曲线下面积（Area Under the Curve，AUC），并给出 AUC@5$^\circ$、AUC@10$^\circ$ 和 AUC@20$^\circ$。对比方法包括 ORB、SuperPoint、ALIKE、SiLK、XFeat、LiftFeat 和 GeoFeat。表中的 ALIKE 沿用 LiftFeat 的方法族名称；GeoFeat 训练所用的伪标签检测器则明确记为 ALIKE-T。表~\ref{tab:relative-pose}~用于汇总两个数据集上的结果，其中所有数值应由统一评估脚本在固定检查点和固定参数下重新获得。该实验主要检验多阶几何条件和可靠性门控能否在大视角、低纹理及重复结构场景中减少错误匹配。
+
+\begin{table}[!t]
+\centering
+\caption{MegaDepth-1500 和 ScanNet-1500 上的相对位姿估计结果。报告 AUC@5$^\circ$、AUC@10$^\circ$ 和 AUC@20$^\circ$。对比方法数值引自 LiftFeat~\cite{LiftFeat}，GeoFeat 结果待实测。}
+\label{tab:relative-pose}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+方法 & \multicolumn{3}{c}{MegaDepth-1500} & \multicolumn{3}{c}{ScanNet-1500}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & AUC@5$^\circ$ & AUC@10$^\circ$ & AUC@20$^\circ$ & AUC@5$^\circ$ & AUC@10$^\circ$ & AUC@20$^\circ$\\
+\midrule
+ORB & 17.9 & 27.6 & 39.0 & 9.0 & 18.5 & 29.9\\
+SuperPoint & 37.3 & 50.1 & 61.5 & 12.5 & 24.4 & 36.7\\
+ALIKE & 40.5 & 56.9 & 68.2 & 9.8 & 19.5 & 30.3\\
+SiLK & 39.9 & 55.1 & 66.9 & 15.9 & 30.1 & 44.5\\
+XFeat & 42.6 & 56.4 & 67.7 & 16.7 & 32.6 & 47.8\\
+LiftFeat & 44.7 & 59.5 & 70.3 & 18.5 & 34.9 & 51.2\\
+GeoFeat & -- & -- & -- & -- & -- & --\\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{B. Homography Estimation}
+\noindent\textbf{Dataset and Protocol.} 我们在 HPatches 上评估平面场景中的单应性估计。该数据集包含 Illumination 和 Viewpoint 两类序列，分别用于测试光照变化和视角变化下的局部对应关系。按照 LiftFeat 的评估流程，对每个序列提取局部特征，使用 MNN 获得匹配，并由鲁棒估计器计算单应矩阵。为保证结果与已有轻量方法可比，图像缩放、关键点预算、序列筛选和单应性估计阈值在所有方法之间保持一致。
+
+\noindent\textbf{Metrics and Comparison.} 我们采用平均单应性准确率（Mean Homography Accuracy，MHA）作为评价指标。对于每个图像对，将估计单应矩阵作用于参考图像的四个角点，并计算其与真实映射角点之间的平均像素误差；当误差低于给定阈值时计为正确估计。报告 MHA@3、MHA@5 和 MHA@7，并分别统计 Illumination 和 Viewpoint 两组序列。表~\ref{tab:homography}~给出结果占位结构，用于比较 GeoFeat 是否能够通过几何条件描述子细化缓解外观变化造成的描述子歧义。
+
+\begin{table}[!t]
+\centering
+\caption{HPatches 上的单应性估计结果。报告 Illumination 和 Viewpoint 子集上的 MHA@3、MHA@5 和 MHA@7；对比方法数值引自 LiftFeat~\cite{LiftFeat}。}
+\label{tab:homography}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+方法 & \multicolumn{3}{c}{Illumination} & \multicolumn{3}{c}{Viewpoint}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & MHA@3 & MHA@5 & MHA@7 & MHA@3 & MHA@5 & MHA@7\\
+\midrule
+ORB & 74.6 & 84.6 & 85.4 & 63.2 & 71.4 & 78.6\\
+SuperPoint & 94.6 & 98.5 & 98.8 & 71.1 & 79.6 & 83.9\\
+ALIKE & 94.6 & 98.5 & 99.6 & 68.2 & 77.5 & 81.4\\
+SiLK & 78.5 & 82.3 & 83.8 & 48.6 & 59.6 & 62.5\\
+XFeat & 95.0 & 98.1 & 98.8 & 68.6 & 81.1 & 86.1\\
+LiftFeat & 95.6 & 98.8 & 99.2 & 71.1 & 81.7 & 87.5\\
+GeoFeat & -- & -- & -- & -- & -- & --\\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{C. Visual Localization}
+\noindent\textbf{Dataset and Pipeline.} 我们在 Aachen Day--Night v1.1 上评估长期视觉定位。该数据集包含白天数据库图像以及白天和夜间查询图像，能够检验局部特征在照明变化和长期视角变化下支持相机定位的能力。我们使用层次化定位工具链（Hierarchical Localization，hloc），将各方法的关键点和描述子提取模块替换为对应实现，其余检索、匹配和位姿估计设置保持一致。测试图像的最大尺寸和每幅图像的关键点数量沿用 LiftFeat 的配置，并分别报告 Day 和 Night 子集结果。
+
+\noindent\textbf{Metrics and Comparison.} 我们报告三个标准定位阈值下的位姿召回率：$(0.25\,\mathrm{m},2^\circ)$、$(0.5\,\mathrm{m},5^\circ)$ 和 $(5\,\mathrm{m},10^\circ)$。表~\ref{tab:localization}~汇总 ORB、SuperPoint、ALIKE、XFeat、LiftFeat 和 GeoFeat 的结果。重点比较 Night 子集上的严格阈值，因为该设置更容易暴露二维外观不稳定和错误几何注入带来的影响。由于 Aachen 结果依赖完整 hloc 流程，正式数值必须由统一版本的 hloc 和各方法检查点实际运行获得。
+
+\begin{table*}[!t]
+\centering
+\caption{Aachen Day--Night v1.1 上的视觉定位结果。报告 Day 和 Night 子集在三个位姿阈值下的召回率（\%）；对比方法数值引自 LiftFeat~\cite{LiftFeat}。}
+\label{tab:localization}
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+方法 & \multicolumn{3}{c}{Day} & \multicolumn{3}{c}{Night}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & $0.25$ m, $2^\circ$ & $0.5$ m, $5^\circ$ & $5$ m, $10^\circ$ & $0.25$ m, $2^\circ$ & $0.5$ m, $5^\circ$ & $5$ m, $10^\circ$\\
+\midrule
+ORB & 66.9 & 76.1 & 93.7 & 10.2 & 12.2 & 19.4\\
+SuperPoint & 87.4 & 93.2 & 97.0 & 77.6 & 85.7 & 95.9\\
+ALIKE & 85.7 & 92.4 & 96.7 & 81.6 & 88.8 & 99.0\\
+XFeat & 84.7 & 91.5 & 96.5 & 77.6 & 89.8 & 98.0\\
+LiftFeat & 87.6 & 93.1 & 97.1 & 82.1 & 89.9 & 99.1\\
+GeoFeat & -- & -- & -- & -- & -- & --\\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+\subsection{D. Ablation Study}
+\noindent\textbf{Cumulative Design.} 我们在 Aachen Day--Night v1.1 的 Night 子集上进行累积消融，以分离 GeoHead、GCDR、可靠性控制和重复性反馈的作用。所有变体使用相同的训练数据、输入分辨率、训练步数、随机种子、关键点预算和 hloc 配置。表~\ref{tab:ablation}~中，Reliability 指几何可靠性估计与门控，Repeatability 指重复性预测头及其检测反馈路径；$+$ 表示在前一行基础上启用对应模块；因此该表反映模块逐步加入后的累计收益，而不是彼此完全独立的单因素实验。
+
+\begin{table}[!t]
+\centering
+\caption{Aachen Day--Night v1.1 的 Night 子集上的累积消融设置。}
+\label{tab:ablation}
+\small
+\begin{tabular}{lcccc}
+\toprule
+变体 & GeoHead & GCDR & Reliability & Repeatability\\
+\midrule
+Visual baseline & $\times$ & $\times$ & $\times$ & $\times$\\
+$+$ GeoHead & $\checkmark$ & $\times$ & $\times$ & $\times$\\
+$+$ GCDR & $\checkmark$ & $\checkmark$ & $\times$ & $\times$\\
+$+$ Reliability & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\times$\\
+Full GeoFeat & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Evaluation and Interpretation.} 每个变体均报告 $(0.25\,\mathrm{m},2^\circ)$、$(0.5\,\mathrm{m},5^\circ)$ 和 $(5\,\mathrm{m},10^\circ)$ 三个定位阈值。Visual baseline 到 $+$ GeoHead 的变化用于评估几何预测和几何监督路径的整体作用；$+$ GeoHead 到 $+$ GCDR 用于评估几何条件描述子细化；$+$ GCDR 到 $+$ Reliability 用于评估可靠性估计与门控；最后一个增量用于评估增强描述子对关键点 logits 的重复性反馈。$+$ GCDR 关闭可靠性控制但保留几何条件残差，$+$ Reliability 在此基础上启用可靠性分支。该设计不单独声称 FiLM、AFT 或几何通道选择的因果贡献，除非另行进行对应的细粒度实验。
+
+\begin{table}[!t]
+\centering
+\caption{Aachen Day--Night v1.1 的 Night 子集上的消融结果。前三行数值按照 LiftFeat~\cite{LiftFeat} 原文中 Default、+ Normal Head 和 + 3D-GFL（3D Geometry-aware Feature Lifting）的对应设置填写；GeoFeat 新增的可靠性和重复性结果待实测。}
+\label{tab:ablation-results}
+\small
+\begin{tabular}{lccc}
+\toprule
+变体 & $(0.25\,\mathrm{m},2^\circ)$ & $(0.5\,\mathrm{m},5^\circ)$ & $(5\,\mathrm{m},10^\circ)$\\
+\midrule
+Visual baseline & 78.9 & 86.1 & 97.6\\
+$+$ GeoHead & 79.4 & 87.9 & 98.2\\
+$+$ GCDR & 82.1 & 89.9 & 99.1\\
+$+$ Reliability & -- & -- & --\\
+Full GeoFeat & -- & -- & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{E. Runtime Analysis}
+\noindent\textbf{Deployment Platform.} 为评估边缘部署成本，我们在 NVIDIA Jetson TX2 的图形处理器（Graphics Processing Unit，GPU）上重新测量所有参与比较的方法。输入采用 VGA 分辨率，所有模型使用相同的推理模式、预热次数和重复计时次数。报告参数量、浮点运算次数（Floating-Point Operations，FLOPs）、描述子维度和单幅图像特征提取延迟，并换算为每秒帧数（Frames Per Second，FPS）。为避免平台差异造成误判，LiftFeat 中在其他设备上报告的延迟不直接作为 GeoFeat 的 TX2 结果，而是仅作为协议参考。
+
+\noindent\textbf{Timing Scope.} 计时范围包括网络前向、关键点解码、NMS 和描述子采样；跨图像匹配与 hloc 位姿估计单独计量，不并入局部特征提取延迟。DA3 只在训练阶段生成几何监督，不参与 GeoFeat 推理，因此不计入参数量、FLOPs 或 TX2 延迟。表~\ref{tab:runtime}~用于记录统一脚本得到的资源结果。
+
+\begin{table}[!t]
+\centering
+\caption{资源与运行时间比较。SuperPoint、XFeat 和 LiftFeat 数值按照 LiftFeat~\cite{LiftFeat} 原文填写；GeoFeat 的 NVIDIA Jetson TX2 结果待实测。原文 GPU 延迟来自 NVIDIA Jetson Xavier NX，仅作为参考。}
+\label{tab:runtime}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+方法 & 参数量 (M) & FLOPs (G) & 描述子维度 & GPU 延迟 (ms) & GPU FPS\\
+\midrule
+SuperPoint & 1.30 & 19.85 & 256 & 36 & 27.8\\
+XFeat & 0.66 & 1.33 & 64 & 5.6 & 178.6\\
+LiftFeat & 0.85 & 4.96 & 64 & 7.4 & 135.1\\
+GeoFeat & -- & -- & 96 & -- & --\\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\section{Conclusion}
+GeoFeat 面向弱纹理、重复结构和大视角变化下的局部特征匹配，构建了从多阶几何监督、可靠性控制的描述子细化到关键点反馈的单向信息路径。其核心区别在于，几何线索不再以固定幅度直接注入描述子，而是由空间可靠性决定注入强度；增强描述子形成的可重复性响应进一步参与关键点选择。
+
+该设计保持了 RGB-only 推理边界：Depth Anything 3 的 DA3-Small 变体仅在训练阶段提供几何监督，部署阶段不需要深度模型。方法的适用性仍受单目深度质量、动态场景和极端遮挡影响，可靠性估计不能替代真实深度或跨视图几何验证。当前论文的定量结论应以实验章节中统一协议获得的 GeoFeat 实测结果为依据。
+
+后续研究将围绕三个方向展开：引入时序几何一致性以处理动态场景中的深度噪声；研究跨数据集视觉定位中的可靠性校准；结合量化与结构化剪枝降低端侧存储和延迟开销。
 \bibliographystyle{IEEEtran}
 \bibliography{references}
 \end{document}

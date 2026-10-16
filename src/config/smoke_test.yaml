@@ -1,0 +1,53 @@
+model_name: GeoFeat-Lightning
+
+datamodule:
+  use_megadepth: true
+  use_coco: true
+  megadepth_root_path: ./datasets/MegaDepth
+  megadepth_batch_size: 1
+  coco_root_path: ./datasets/coco_20k
+  coco_batch_size: 1
+  training_res: [800, 600]
+  device: cuda
+  num_workers: 0
+  steps_per_epoch: 1000
+
+trainer:
+  strategy: auto
+  accelerator: "gpu"
+  devices: 1
+  max_steps: 10
+  ckpt_path:
+  ckpt:
+    filename: "geofeat-step{step}"
+    every_n_train_steps: 1
+    save_top_k: -1
+    save_last: false
+  best_ckpt:
+    filename: "geofeat-best-step{step}"
+    monitor: loss
+    every_n_train_steps: 1
+    mode: min
+    save_top_k: 1
+    save_last: true
+  lr_monitor:
+    logging_interval: step
+  csv_logger:
+    save_dir: weights
+    name: train
+
+model:
+  backbone: RepVGG
+  keypoint_dim: 65
+  descriptor_dim: 64
+  optimizer:
+    name: Adam
+    lr: 0.0003
+  scheduler:
+    name: StepLR
+    step_size: 10000
+    gamma: 0.5
+  ablation:
+    disable_gcdr: false
+    disable_geo_head: false
+    disable_repeatability: false

@@ -13,82 +13,18 @@ from einops import rearrange
 import tqdm
 import math
 import cv2
+import time
+from typing import Any, cast
+
+import lightning.pytorch as pl
 
 import sys
 from typing import List, Tuple, Optional
-from src.config.config import get_cfg_defaults, get_model_config
-
-# Canonical architecture/loss contract frozen from
-# weights_0601/GRR50_20260617_030552/config_snapshot.json.
-# Keep these values in code so experiment YAML files cannot silently change the
-# model or objective.  Only the explicit ABLATION switches in config.py may
-# disable GCDR/GeoHead for controlled ablation runs.
-FIXED_MODEL_CONFIG = {
-	'backbone': 'RepVGG',
-	'backbone_channels': [20, 20, 40, 80, 96],
-	'keypoint_encoder': [128, 64, 64], 'keypoint_dim': 65,
-	'descriptor_encoder': [96], 'descriptor_dim': 96,
-	'geometric_features': {'depth': True, 'normal': False, 'gradients': True, 'curvatures': True},
-	'depth_encoder': [32, 48], 'depth_dim': 96,
-	'gradient_encoder': [48, 64], 'gradient_dim': 96,
-	'curvature_encoder': [32, 48], 'curvature_dim': 96,
-	'geo_preprocess_mode': 'no_unfold_lite', 'repeatability_alpha': 0.35,
-	'attention_layers': 2,
-	'aft_config': {'num_groups': 4, 'local_kernel_sizes': [3, 5], 'domain_adapt': True,
-		'temperature_min': 0.7, 'temperature_max': 1.6, 'local_base_gain': 1.0, 'corr_base_gain': 0.5},
-	'geo_reliability_gate': {'enabled': True, 'hidden_dim': 12, 'gate_floor': 0.2,
-		'bias_init': 2.0, 'fusion_gain': 0.5},
-	'refiner_type': 'GCDR',
-	'gcdr_config': {'geo_compress': 12, 'reliability_hidden': 12, 'gate_floor': 0.1,
-		'residual_gain': 0.35, 'residual_gate_floor': 0.05, 'residual_clip': 0.1,
-		'complementarity_enabled': False, 'texture_kernel_size': 5,
-		'texture_temperature': 8.0, 'complementarity_floor': 0.25},
-	'last_activation': 'None', 'output_dim': 96,
-	'head_in_channels': 40,
-	'keypoint_head_channels': None,
-	'descriptor_head_channels': None,
-	'repeatability_adaptive_gamma': 0.0,
-	'descriptor_confidence_gain': 0.0,
-}
-
-FIXED_LOSS_CONFIG = {
-	'reliability_loss_weight': 0.25, 'reliability_consistency_weight': 0.25,
-	'reliability_target_scale': 6.0, 'repeatability_loss_weight': 0.03,
-	'depth_weight': 1.0, 'gradient_weight': 5.0, 'curvature_weight': 2.0,
-	'geo_loss_reliability_weighted': True, 'geo_loss_unreliable_floor': 0.25,
-	'descriptor_protect_weight': 0.1, 'reliable_enhance_margin': 0.02,
-	'reliable_enhance_weight': 0.05, 'reliable_enhance_threshold': 0.5,
-	'reliable_enhance_quantile': 0.5, 'unreliable_suppress_weight': 0.1,
-	'unreliable_suppress_threshold': 0.45, 'unreliable_suppress_quantile': 0.25,
-}
-
-def _make_model_config(cfg):
-	"""Build the internal model contract from the public config options."""
-	from copy import deepcopy
-	model = deepcopy(FIXED_MODEL_CONFIG)
-	model['loss_config'] = deepcopy(FIXED_LOSS_CONFIG)
-	model['backbone'] = cfg.MODEL.BACKBONE
-	model['backbone_channels'] = list(cfg.MODEL.BACKBONE_CHANNELS)
-	model['keypoint_encoder'] = list(cfg.MODEL.KEYPOINT_ENCODER)
-	model['keypoint_dim'] = cfg.MODEL.KEYPOINT_DIM
-	model['descriptor_encoder'] = list(cfg.MODEL.DESCRIPTOR_ENCODER)
-	model['descriptor_dim'] = cfg.MODEL.DESCRIPTOR_DIM
-	model['geometric_features'] = {
-		'depth': cfg.MODEL.GEOMETRIC_FEATURES.DEPTH,
-		'normal': False,
-		'gradients': cfg.MODEL.GEOMETRIC_FEATURES.GRADIENTS,
-		'curvatures': cfg.MODEL.GEOMETRIC_FEATURES.CURVATURES,
-	}
-	if cfg.ABLATION.DISABLE_GCDR:
-		model['refiner_type'] = 'None'
-	if cfg.ABLATION.DISABLE_GEO_HEAD:
-		model['geometric_features'] = {
-			'depth': False, 'normal': False,
-			'gradients': False, 'curvatures': False,
-		}
-		model['refiner_type'] = 'None'
-	return model
-
+from src.loss.loss import GeoFeatLoss, get_loss_config
+from src.data import megadepth_wrapper
+from src.utils.alike_wrapper import ALikeExtractor
+from src.utils.depth_anything_wrapper import DepthAnythingExtractor
+from src.model.GeometricExtractor import GeometricExtractor
 
 """
 foundational functions
@@ -145,8 +81,6 @@ def soft_argmax_refinement(keypoints, scores, radius: int):
 		refined_keypoints.append(kpts.float() + delta)
 	return refined_keypoints
 
-# The original keypoint sampling is incorrect. We patch it here but
-# keep the original one above for legacy.
 def sample_descriptors_fix_sampling(keypoints, descriptors, s: int = 8):
 	"""Interpolate descriptors at keypoint locations"""
 	b, c, h, w = descriptors.shape
@@ -170,8 +104,10 @@ class StandardBackbone(nn.Module):
 	fuses these maps back to the x3 stride so detector, descriptor, and geometry
 	heads share one dense feature grid.
 	"""
-	def __init__(self, c1=24, c2=24, c3=64, c4=64, c5=128):
+	def __init__(self):
 		super().__init__()
+		c1, c2, c3, c4, c5 = 20, 20, 40, 80, 96
+		self.output_channels = (c3, c4, c5)
 		self.relu = nn.ReLU(inplace=True)
 		self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
@@ -203,7 +139,6 @@ class StandardBackbone(nn.Module):
 		x5 = self.relu(self.conv5b(x5))
 		x5 = self.pool(x5)
 		return x3, x4, x5
-
 
 # ========== RepVGG Backbone ==========
 # RepVGG骨干网络，使用可转换为单分支卷积的多分支模块。训练时使用多分支结构以增加容量，部署时可以转换为单3x3卷积以加速推理。
@@ -330,8 +265,10 @@ class RepVGGBackbone(nn.Module):
 	Training uses multi-branch RepVGGBlock modules. The branch fusion helpers above
 	can convert each block into one 3x3 conv for faster deployment if needed.
 	"""
-	def __init__(self, c1=24, c2=24, c3=64, c4=64, c5=128):
+	def __init__(self):
 		super().__init__()
+		c1, c2, c3, c4, c5 = 20, 20, 40, 80, 96
+		self.output_channels = (c3, c4, c5)
 		self.relu = nn.ReLU(inplace=True)
 		self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
@@ -363,7 +300,6 @@ class RepVGGBackbone(nn.Module):
 		x5 = self.relu(self.conv5b(x5))
 		x5 = self.pool(x5)
 		return x3, x4, x5
-
 
 # --------- UpsampleLayer Classes ---------
 # ========== UpsampleLayer ==========
@@ -449,39 +385,22 @@ class DescriptorHead(nn.Module):
 		# x=nn.functional.softmax(x,dim=1)
 		return x
 
-class HeatmapHead(nn.Module):
-	def __init__(self,in_channels,mid_channels,out_channels):
-		super().__init__()
-		self.convHa = nn.Conv2d(in_channels, mid_channels, kernel_size=3, stride=1, padding=1)
-		self.bnHa = nn.BatchNorm2d(mid_channels)
-		self.convHb = nn.Conv2d(mid_channels, out_channels, kernel_size=3, stride=1, padding=1)
-		self.bnHb = nn.BatchNorm2d(out_channels)
-		self.leaky_relu = nn.LeakyReLU(0.1)
-
-	def forward(self,x):
-		x = self.leaky_relu(self.bnHa(self.convHa(x)))
-		x = self.leaky_relu(self.bnHb(self.convHb(x)))
-
-		x = torch.sigmoid(x)
-		return x
-
 class GeoHead(nn.Module):
 	"""LiftFeat-style geometry head with dynamic output branches.
 
-	Depending on config, it predicts depth, first-order gradients, and/or
-	curvature-like channels. Mainline gradients include
-	(dx, dy, normal_x, normal_y, normal_z). The branch order is fixed because
+	Depending on config, it predicts depth, gradients (dx, dy), normals
+	(nx, ny, nz), and Hessian proxies (half-trace H, half-eigenvalue-gap D).
+	The branch order is fixed because
 	FeatureBooster later slices the concatenated geometry tensor in the same order.
 	"""
 	def __init__(self, in_channels: int, geo_cfg: dict):
 		super().__init__()
 		# Track branch names and per-branch channel counts for selective normalization
-		gradient_channels = 2 if bool(geo_cfg['normal']) else 5
 		branch_defs = [
 			('depth', 1),
-			('normal', 3),
-			('gradients', gradient_channels),
-			('curvatures', 1),
+			('gradients', 2),
+			('normals', 3),
+			('curvatures', 2),
 		]
 		self._branch_names = []
 		self._branch_channels = []
@@ -492,9 +411,7 @@ class GeoHead(nn.Module):
 				self._branch_channels.append(ch)
 				out_ch += ch
 		if out_ch == 0:
-			out_ch = 1  # fallback to avoid empty head
-			self._branch_names = ['depth']
-			self._branch_channels = [1]
+			raise ValueError("GeoHead requires at least one enabled geometric feature")
 
 		self.out_channels = out_ch
 		# three-stage upsample like LiftFeat DepthHead
@@ -528,21 +445,31 @@ class GeoHead(nn.Module):
 		x3 = torch.cat([x2_0,x3],dim=1)
 		x = self.leaky_relu(self.bnDepc(self.convDepc(x3)))
 
-		# Selective normalization: normalize the normal sub-vector embedded in
-		# the gradients branch.
+		# Only surface normals are constrained to unit length.
 		parts = x.split(self._branch_channels, dim=1)
 		out = []
 		for i, name in enumerate(self._branch_names):
 			p = parts[i]
-			if name == 'normal':
+			if name == 'normals':
 				p = F.normalize(p, p=2, dim=1)
-			elif name == 'gradients' and p.shape[1] >= 5:
-				grad_xy = p[:, :2]
-				normal_xyz = F.normalize(p[:, 2:5], p=2, dim=1)
-				p = torch.cat([grad_xy, normal_xyz], dim=1)
 			out.append(p)
 		return torch.cat(out, dim=1)
 
+# class HeatmapHead(nn.Module):
+# 	def __init__(self,in_channels,mid_channels,out_channels):
+# 		super().__init__()
+# 		self.convHa = nn.Conv2d(in_channels, mid_channels, kernel_size=3, stride=1, padding=1)
+# 		self.bnHa = nn.BatchNorm2d(mid_channels)
+# 		self.convHb = nn.Conv2d(mid_channels, out_channels, kernel_size=3, stride=1, padding=1)
+# 		self.bnHb = nn.BatchNorm2d(out_channels)
+# 		self.leaky_relu = nn.LeakyReLU(0.1)
+
+# 	def forward(self,x):
+# 		x = self.leaky_relu(self.bnHa(self.convHa(x)))
+# 		x = self.leaky_relu(self.bnHb(self.convHb(x)))
+
+# 		x = torch.sigmoid(x)
+# 		return x
 # --------- Encoder Classes ---------
 # 编码器类，使用MLP将几何属性和描述子映射到特征空间。每个编码器都可以选择性地应用dropout以增强训练时的鲁棒性。
 def MLP(channels: List[int], do_bn: bool = False) -> nn.Module:
@@ -570,9 +497,9 @@ def MLP_no_ReLU(channels: List[int], do_bn: bool = False) -> nn.Module:
 
 class KeypointEncoder(nn.Module):
 	""" Encoding of geometric properties using MLP """
-	def __init__(self, keypoint_dim: int, feature_dim: int, layers: List[int], dropout: bool = False, p: float = 0.1) -> None:
+	def __init__(self, keypoint_dim: int, feature_dim: int, dropout: bool = False, p: float = 0.1) -> None:
 		super().__init__()
-		self.encoder = MLP([keypoint_dim] + layers + [feature_dim])
+		self.encoder = MLP([keypoint_dim, 128, 64, 64, feature_dim])
 		self.use_dropout = dropout
 		self.dropout = nn.Dropout(p=p)
 
@@ -583,9 +510,9 @@ class KeypointEncoder(nn.Module):
 
 class DescriptorEncoder(nn.Module):
 	""" Encoding of visual descriptor using MLP """
-	def __init__(self, feature_dim: int, layers: List[int], dropout: bool = False, p: float = 0.1) -> None:
+	def __init__(self, feature_dim: int, dropout: bool = False, p: float = 0.1) -> None:
 		super().__init__()
-		self.encoder = MLP([feature_dim] + layers + [feature_dim])
+		self.encoder = MLP([feature_dim, 96, feature_dim])
 		self.use_dropout = dropout
 		self.dropout = nn.Dropout(p=p)
 
@@ -608,7 +535,6 @@ class GeometricEncoder(nn.Module):
 			return self.dropout(self.encoder(x))
 		return self.encoder(x)
 
-# Reliability gate for encoded geometry before descriptor/keypoint modulation.
 class GeometryReliabilityGate(nn.Module):
 	"""Predict where geometry is trustworthy enough to guide refinement.
 
@@ -701,7 +627,6 @@ class GCDR(nn.Module):
 		complementarity_floor: float = 0.25,
 	):
 		super().__init__()
-		self.dim = dim
 		self.gate_floor = float(max(0.0, min(gate_floor, 1.0)))
 		self.residual_gain = float(max(0.0, residual_gain))
 		self.residual_gate_floor = float(max(0.0, min(residual_gate_floor, 1.0)))
@@ -731,54 +656,28 @@ class GCDR(nn.Module):
 			nn.GELU(),
 			nn.Conv2d(reliability_hidden, 1, 1),
 		)
-		rel_out = self.reliability_head[-1]
-		if isinstance(rel_out, nn.Conv2d):
-			nn.init.zeros_(rel_out.weight)
-			if rel_out.bias is not None:
-				nn.init.zeros_(rel_out.bias)
+		nn.init.zeros_(self.reliability_head[-1].weight)
+		nn.init.zeros_(self.reliability_head[-1].bias)
 
 		self.norm = nn.LayerNorm(dim)
 
-	def forward(self, desc: torch.Tensor, geo_v: torch.Tensor):
-		"""Refine NHWC descriptors using NCHW geometry.
-
-		Args:
-			desc: Descriptor map in (B, H, W, C), matching linear encoder format.
-			geo_v: Geometry map in (B, C_geo, H, W).
-		Returns:
-			A refined descriptor map in NHWC and a reliability map in NCHW.
-		"""
-		desc_map = desc.permute(0, 3, 1, 2)
-		geo_feat = self.geo_proj(geo_v)
-
-		# Reliability is estimated from both current descriptors and compressed
-		# geometry, then reused as a gate for all geometry-conditioned residuals.
-		reliability_logits = self.reliability_head(torch.cat([desc_map, geo_feat], dim=1))
-		reliability_map = torch.sigmoid(reliability_logits)
-		out, effective_reliability, texture_weakness = self.refine_with_reliability(desc, geo_feat, reliability_map)
-		aux = {
+	def _aux(self, effective_reliability, texture_weakness):
+		return {
 			'effective_reliability_map': effective_reliability,
 			'texture_weakness_map': texture_weakness,
 		}
-		return out, reliability_map, aux
 
 	def forward_with_reliability(self, desc: torch.Tensor, geo_v: torch.Tensor, reliability_map: torch.Tensor):
 		"""Refine descriptors using an externally estimated geometry reliability map."""
 		geo_feat = self.geo_proj(geo_v)
-		if reliability_map.shape[-2:] != geo_feat.shape[-2:]:
-			reliability_map = F.interpolate(
-				reliability_map,
-				size=geo_feat.shape[-2:],
-				mode='bilinear',
-				align_corners=False,
-			)
-		reliability_map = reliability_map.clamp(0.0, 1.0)
-		out, effective_reliability, texture_weakness = self.refine_with_reliability(desc, geo_feat, reliability_map)
-		aux = {
-			'effective_reliability_map': effective_reliability,
-			'texture_weakness_map': texture_weakness,
-		}
-		return out, reliability_map, aux
+		reliability_map = F.interpolate(
+			reliability_map,
+			size=geo_feat.shape[-2:],
+			mode='bilinear',
+			align_corners=False,
+		).clamp(0.0, 1.0)
+		out, effective, texture = self.refine_with_reliability(desc, geo_feat, reliability_map)
+		return out, reliability_map, self._aux(effective, texture)
 
 	def _texture_weakness(self, desc: torch.Tensor) -> torch.Tensor:
 		"""Estimate where visual evidence is weak using local descriptor variance."""
@@ -803,24 +702,29 @@ class GCDR(nn.Module):
 			)
 		gate = self.gate_floor + (1.0 - self.gate_floor) * effective_reliability
 
-		film = self.film_gen(geo_feat)
-		scale, shift = film.chunk(2, dim=1)
-		scale = torch.tanh(scale) * gate
-		shift = shift * gate
-
-		scale = scale.permute(0, 2, 3, 1)
-		shift = shift.permute(0, 2, 3, 1)
-
+		scale, shift = self.film_gen(geo_feat).chunk(2, dim=1)
+		gate = gate.permute(0, 2, 3, 1)
+		scale = torch.tanh(scale).permute(0, 2, 3, 1) * gate
+		shift = shift.permute(0, 2, 3, 1) * gate
 		residual = desc * scale + shift
 		if self.residual_clip > 0:
 			residual = residual.clamp(min=-self.residual_clip, max=self.residual_clip)
 		residual_gate = self.residual_gate_floor + (1.0 - self.residual_gate_floor) * effective_reliability
-		residual_gate = residual_gate.permute(0, 2, 3, 1)
-		out = desc + (self.residual_gain * residual_gate) * residual
+		out = desc + self.residual_gain * residual_gate.permute(0, 2, 3, 1) * residual
 		out = self.norm(out)
 		return out, effective_reliability, texture_weakness
 
-# --------- Linear Attention with Local Correlation & Domain-Dynamic Adaptation ---------
+	def forward(self, desc: torch.Tensor, geo_v: torch.Tensor):
+		"""Refine descriptors and estimate geometry reliability."""
+		desc_map = desc.permute(0, 3, 1, 2)
+		geo_feat = self.geo_proj(geo_v)
+		reliability_map = torch.sigmoid(
+			self.reliability_head(torch.cat([desc_map, geo_feat], dim=1))
+		)
+		out, effective, texture = self.refine_with_reliability(desc, geo_feat, reliability_map)
+		return out, reliability_map, self._aux(effective, texture)
+
+# --------- Linear Attention with Local Correlation ---------
 # 负责空间上下文传播和局部相关性增强
 # 线性注意力模块，结合了局部相关性增强和域动态适应。保持了线性全局AFT路径，同时注入多尺度局部结构和局部自相关图。
 # 在推理过程中，它根据当前特征统计适应注意力温度、局部分支增益和相关增益，而不是依赖训练域的运行统计。
@@ -1030,22 +934,21 @@ class FeedForwardNetwork(nn.Module):
 
 # Attention + FFN 残差块
 class AFTBlock(nn.Module):
-	"""AFT attention with selectable FFN (PFFN or Swin)."""
+	"""AFT attention followed by a residual feed-forward network."""
 
-	def __init__(self, feature_dim: int, model_config: Optional[dict] = None, dropout: bool = False, p: float = 0.1):
+	def __init__(self, feature_dim: int, dropout: bool = False, p: float = 0.1):
 		super().__init__()
-		aft_cfg = dict((model_config or {})['aft_config'])
 		self.attn = AFTAttention(
 			feature_dim,
-			num_groups=int(aft_cfg['num_groups']),
+			num_groups=4,
 			dropout=dropout,
 			p=p,
-			local_kernel_sizes=tuple(aft_cfg['local_kernel_sizes']),
-			domain_adapt=bool(aft_cfg['domain_adapt']),
-			temperature_min=float(aft_cfg['temperature_min']),
-			temperature_max=float(aft_cfg['temperature_max']),
-			local_base_gain=float(aft_cfg['local_base_gain']),
-			corr_base_gain=float(aft_cfg['corr_base_gain']),
+			local_kernel_sizes=(3, 5),
+			domain_adapt=True,
+			temperature_min=0.7,
+			temperature_max=1.6,
+			local_base_gain=1.0,
+			corr_base_gain=0.5,
 		)
 		self.ffn = FeedForwardNetwork(feature_dim, dropout=dropout, p=p)
 
@@ -1057,13 +960,12 @@ class AFTBlock(nn.Module):
 
 # 多个AFTBlock堆叠
 class AttentionalNN(nn.Module):
-	def __init__(self, feature_dim: int, layer_num: int, model_config: dict, dropout: bool = False, p: float = 0.1) -> None:
+	def __init__(self, feature_dim: int, layer_num: int, dropout: bool = False, p: float = 0.1) -> None:
 		super().__init__()
-		self.model_config = model_config
 		self.layers = nn.ModuleList()
 
 		for _ in range(layer_num):
-			self.layers.append(AFTBlock(feature_dim, model_config=model_config, dropout=dropout, p=p))
+			self.layers.append(AFTBlock(feature_dim, dropout=dropout, p=p))
 
 	def forward(self, desc: torch.Tensor, shape: Optional[Tuple[int,int]] = None) -> torch.Tensor:
 		for layer in self.layers:
@@ -1079,149 +981,111 @@ class FeatureBooster(nn.Module):
 	"""
 	def __init__(self, model_config, dropout=False, p=0.1):
 		super().__init__()
-		self.model_config = model_config
-		self.geo_preprocess_mode = self.model_config['geo_preprocess_mode']
+		# GeoFeat's geometry path is part of the default model definition.
+		# Keep the fields internally for downstream modules, but do not require
+		# them in the external YAML model configuration.
+		model_config = dict(model_config)
+		ablation = model_config['ablation']
+		model_config['geometric_features'] = {
+			'depth': not ablation['disable_geo_head'],
+			'gradients': not ablation['disable_geo_head'],
+			'normals': not ablation['disable_geo_head'],
+			'curvatures': not ablation['disable_geo_head'],
+		}
+		model_config['refiner_type'] = 'GCDR' if not ablation['disable_gcdr'] else 'None'
 		self.use_dropout = dropout
 		self.dropout = nn.Dropout(p=p)
-
-		# self.kenc = KeypointEncoder(self.config['keypoint_dim'], self.config['descriptor_dim'], self.config['keypoint_encoder'], dropout=dropout)
-
-		self.denc = DescriptorEncoder(self.model_config['descriptor_dim'], self.model_config['descriptor_encoder'], dropout=dropout)
+		descriptor_dim = model_config['descriptor_dim']
+		self.denc = DescriptorEncoder(descriptor_dim, dropout=dropout)
 
 		# Geometric features setup
-		self.geo_raw_dims = {
+		geo_dims = {
 			'depth': 1,
-			'normal': 3,
-			'gradients': 5,
-			'curvatures': 1,
+			'gradients': 2,
+			'normals': 3,
+			'curvatures': 2,
 		}
-		if bool(self.model_config['geometric_features']['normal']):
-			self.geo_raw_dims['gradients'] = 2
 		self.geo_encoders = nn.ModuleDict()
 		self.geo_branch_gates = nn.ModuleDict()
 		self.geo_specs = []
 
-		geo_cfg = self.model_config['geometric_features']
-		# Order must match GeoHead: depth -> gradients -> curvatures.
-		# Mainline gradients are [dx, dy, normal_x, normal_y, normal_z].
-		features_map = [
-			('depth', 'depth_encoder'),
-			('normal', 'normal_encoder'),
-			('gradients', 'gradient_encoder'),
-			('curvatures', 'curvature_encoder'),
-		]
-
+		geo_cfg = model_config['geometric_features']
 		geo_input_dim = 0
-		self.geo_preprocess_mode = self.model_config['geo_preprocess_mode']
-		geo_token_mult = 64 if self.geo_preprocess_mode == 'unfold' else 1
-
-		for name, enc_key in features_map:
-			if bool(geo_cfg[name]):
-				input_dim = self.geo_raw_dims[name] * geo_token_mult
-
-				# Each geometry branch is encoded independently to descriptor_dim.
-				# The branch gate below suppresses unreliable or low-information
-				# branches on a per-image basis before summing them.
-				encoder_layers = self.model_config[enc_key]
+		for name, input_dim in geo_dims.items():
+			if geo_cfg[name]:
 				self.geo_encoders[name] = GeometricEncoder(
 					input_dim,
-					self.model_config['descriptor_dim'], # Target dimension
-					encoder_layers,
+					descriptor_dim,
+					[32, 48],
 					dropout=dropout
 				)
-				gate_hidden = max(8, input_dim // 8)
-				gate_mlp = nn.Sequential(
-					nn.Linear(input_dim, gate_hidden),
+				self.geo_branch_gates[name] = nn.Sequential(
+					nn.Linear(input_dim, 8),
 					nn.ReLU(inplace=True),
-					nn.Linear(gate_hidden, 1),
-					nn.Sigmoid(),
+					nn.Linear(8, 1),
 				)
-				# Backward-compatible default: when old checkpoints do not contain
-				# geo_branch_gates parameters, keep branch contribution near identity.
-				gate_proj = gate_mlp[2]
-				if isinstance(gate_proj, nn.Linear):
-					nn.init.zeros_(gate_proj.weight)
-					nn.init.constant_(gate_proj.bias, 4.0)
-				self.geo_branch_gates[name] = gate_mlp
-				self.geo_specs.append((name, input_dim)) # Store raw_dim for slicing
+				self.geo_specs.append((name, input_dim))
 				geo_input_dim += input_dim
 
-		total_geo_input_dim = geo_input_dim
-		gate_cfg = dict(self.model_config['geo_reliability_gate'])
 		self.geo_reliability_gate = None
-		if bool(gate_cfg['enabled']) and total_geo_input_dim > 0:
+		if geo_input_dim:
 			self.geo_reliability_gate = GeometryReliabilityGate(
-				geo_dim=total_geo_input_dim,
-				feature_dim=self.model_config['descriptor_dim'],
-				hidden_dim=int(gate_cfg['hidden_dim']),
-				gate_floor=float(gate_cfg['gate_floor']),
-				bias_init=float(gate_cfg['bias_init']),
-				fusion_gain=float(gate_cfg['fusion_gain']),
+				geo_dim=geo_input_dim,
+				feature_dim=descriptor_dim,
+				hidden_dim=12,
+				gate_floor=0.2,
+				bias_init=2.0,
+				fusion_gain=0.5,
 			)
 
-		self.attn_proj = AttentionalNN(feature_dim=self.model_config['descriptor_dim'], layer_num=self.model_config['attention_layers'], model_config=self.model_config, dropout=dropout)
+		self.attn_proj = AttentionalNN(descriptor_dim, layer_num=2, dropout=dropout)
+		self.repeatability_enabled = not ablation['disable_repeatability']
 		self.repeatability_head = nn.Sequential(
-			nn.Conv2d(self.model_config['descriptor_dim'], self.model_config['descriptor_dim'], kernel_size=3, padding=1, groups=self.model_config['descriptor_dim'], bias=False),
-			nn.Conv2d(self.model_config['descriptor_dim'], 1, kernel_size=1, bias=True),
+			nn.Conv2d(descriptor_dim, descriptor_dim, kernel_size=3, padding=1, groups=descriptor_dim, bias=False),
+			nn.Conv2d(descriptor_dim, 1, kernel_size=1, bias=True),
 			nn.Sigmoid(),
+		) if self.repeatability_enabled else None
+		# Descriptors are normalized directly after the attention refinement.
+		# There is no configurable final activation in the current model.
+		refiner = GCDR if model_config['refiner_type'] == 'GCDR' else None
+		self.pre_attn_refiner = None
+		if refiner is not None:
+			self.pre_attn_refiner = refiner(
+				dim=descriptor_dim,
+				geo_dim=geo_input_dim,
+				geo_compress=12,
+				reliability_hidden=12,
+				gate_floor=0.1,
+				residual_gain=0.35,
+				residual_gate_floor=0.05,
+				residual_clip=0.1,
+				complementarity_enabled=False,
+				texture_kernel_size=5,
+				texture_temperature=8.0,
+				complementarity_floor=0.25,
+			)
+
+	def encode_geometry(self, geo_v):
+		"""Fuse independent NHWC geometry branches with per-pixel competition."""
+		parts = geo_v.split([dim for _, dim in self.geo_specs], dim=-1)
+		encoded, scores = [], []
+		for (name, _), part in zip(self.geo_specs, parts):
+			encoded.append(self.geo_encoders[name](part))
+			scores.append(self.geo_branch_gates[name](part))
+		# Mean gain remains one, while relative gains compete at every location.
+		weights = len(scores) * torch.softmax(torch.cat(scores, dim=-1), dim=-1)
+		memory = sum(feat * weights[..., i:i+1] for i, feat in enumerate(encoded))
+		conditioned = torch.cat(
+			[part * weights[..., i:i+1] for i, part in enumerate(parts)],
+			dim=-1,
 		)
+		return memory, conditioned, weights.permute(0, 3, 1, 2)
 
-		# [Refiner Integration] Select Refiner based on config
-		# Modes: 'None', 'GCDR'
-		self.refiner_type = model_config['refiner_type']
-		self.pre_attn_refiner = None  # Pre-attention refiner slot (GCDR)
-		if self.refiner_type == 'None':
-			pass
-		elif self.refiner_type == 'GCDR':
-			# GCDR inserts BEFORE AttentionalNN: geometry conditions descriptors
-			# early so attention builds on geometry-aware representations.
-			gcdr_cfg = dict(self.model_config['gcdr_config'])
-			self.pre_attn_refiner = GCDR(
-				dim=self.model_config['descriptor_dim'],
-				geo_dim=total_geo_input_dim,
-				geo_compress=int(gcdr_cfg['geo_compress']),
-				reliability_hidden=int(gcdr_cfg['reliability_hidden']),
-				gate_floor=float(gcdr_cfg['gate_floor']),
-				residual_gain=float(gcdr_cfg['residual_gain']),
-				residual_gate_floor=float(gcdr_cfg['residual_gate_floor']),
-				residual_clip=float(gcdr_cfg['residual_clip']),
-				complementarity_enabled=bool(gcdr_cfg['complementarity_enabled']),
-				texture_kernel_size=int(gcdr_cfg['texture_kernel_size']),
-				texture_temperature=float(gcdr_cfg['texture_temperature']),
-				complementarity_floor=float(gcdr_cfg['complementarity_floor']),
-			)
-		else:
-			raise ValueError(
-				f"Unsupported REFINER_TYPE '{self.refiner_type}'. "
-				"Expected one of: 'None', 'GCDR'. "
-				"Check the frozen model contract in GeoFeatModel.py and ABLATION in config.py."
-			)
-
-	def validate_refiner_configuration(self):
-		refiner_type = str(self.model_config['refiner_type'])
-		if refiner_type == 'GCDR':
-			if self.pre_attn_refiner is None:
-				raise RuntimeError(
-					"Config requests REFINER_TYPE='GCDR', but pre_attn_refiner is None. "
-					"Check MODEL.REFINER_TYPE / MODEL.GCDR in src/config/config.py or your merged YAML override, "
-					"then verify GCDR wiring in GeoFeatModel.py."
-				)
-		elif refiner_type != 'None':
-			raise RuntimeError(
-				f"Config requests unsupported REFINER_TYPE='{refiner_type}'. Only 'None' and 'GCDR' remain wired in GeoFeatModel.py."
-			)
-
-		# Final activation
-		if self.model_config['last_activation'] == 'None':
-			self.last_activation = None
-		elif self.model_config['last_activation'] == 'relu':
-			self.last_activation = nn.ReLU()
-		elif self.model_config['last_activation'] == 'sigmoid':
-			self.last_activation = nn.Sigmoid()
-		elif self.model_config['last_activation'] == 'tanh':
-			self.last_activation = nn.Tanh()
-		else:
-			raise Exception('Not supported activation "%s".' % self.model_config['last_activation'])
+	def estimate_geometry_reliability(self, geo_map, geo_memory):
+		"""Estimate spatial reliability from raw and encoded geometry."""
+		if self.use_dropout:
+			geo_memory = self.dropout(geo_memory)
+		return self.geo_reliability_gate(geo_map, geo_memory)
 
 	def forward(self, desc, kpts, geo_v=None, shape=None):
 		"""Run descriptor enhancement.
@@ -1234,9 +1098,10 @@ class FeatureBooster(nn.Module):
 			shape: Optional spatial shape override for attention tokens.
 		"""
 		# Assume inputs are always 4D dense maps: (B, C, H, W)
-		B, C, H, W = desc.shape
+		_, _, H, W = desc.shape
 		geo_reliability_map = None
 		geo_memory_reliability_map = None
+		geo_branch_weights = None
 		gcdr_aux = {}
 
 		# Ensure geo_v matches desc spatial resolution
@@ -1246,53 +1111,34 @@ class FeatureBooster(nn.Module):
 		# Permute for linear encoding layers: (B, H, W, C)
 		desc_lin = desc.permute(0, 2, 3, 1)
 		geo_v_lin = geo_v.permute(0, 2, 3, 1) if geo_v is not None else None
+		geo_conditioning = geo_v
 
 		# 1. Descriptor Encodings
 		d_encoded = self.denc(desc_lin)
 		if self.use_dropout:
 			d_encoded = self.dropout(d_encoded)
 
-		# 2. Geometry reliability estimation. Geometry encoders summarize 0D/1D/2D
-		# cues only to decide where enhancement is trustworthy; they no longer
-		# directly add geometry content into the descriptor stream.
+		# 2a. Encode geometry and fuse its branches spatially.
 		if geo_v is not None and self.geo_specs:
-			if geo_v_lin is None:
-				raise RuntimeError("geo_v is provided but geo_v_lin is None")
-			geo_encoded_sum = torch.zeros_like(d_encoded)
-			start_idx = 0
-			for name, dim in self.geo_specs:
-				# geo_specs stores the same branch order as GeoHead output, so this
-				# slice recovers one semantic geometry branch at a time.
-				feat_v = geo_v_lin[..., start_idx : start_idx + dim]
-				encoded = self.geo_encoders[name](feat_v)
-				branch_stats = feat_v.mean(dim=(1, 2))
-				branch_gate = self.geo_branch_gates[name](branch_stats).view(-1, 1, 1, 1)
-				geo_encoded_sum = geo_encoded_sum + encoded * branch_gate
-				start_idx += dim
+			geo_encoded_sum, geo_conditioning_lin, geo_branch_weights = self.encode_geometry(geo_v_lin)
+			geo_conditioning = geo_conditioning_lin.permute(0, 3, 1, 2)
 
-			if self.use_dropout:
-				geo_encoded_sum = self.dropout(geo_encoded_sum)
-
+			# 2b. Estimate spatial reliability from the fused geometry.
 			if self.geo_reliability_gate is not None:
-				geo_memory_reliability_map = self.geo_reliability_gate(geo_v, geo_encoded_sum)
+				geo_memory_reliability_map = self.estimate_geometry_reliability(geo_conditioning, geo_encoded_sum)
 
-			fused_desc = d_encoded
-		else:
-			fused_desc = d_encoded
+		fused_desc = d_encoded
 
-		# 3. LiftFeat baseline path: no keypoint encoder injection
-		# GCDR: pre-attention small residual correction (operates in NHWC format).
-		# When the geometry gate is available, it controls where/how much GCDR can
-		# modify descriptors.
-		if self.pre_attn_refiner is not None and geo_v is not None:
+		# 3. Apply reliability-gated GCDR residual refinement before attention.
+		if self.pre_attn_refiner is not None and geo_conditioning is not None:
 			if geo_memory_reliability_map is not None:
 				fused_desc, geo_reliability_map, gcdr_aux = self.pre_attn_refiner.forward_with_reliability(
 					fused_desc,
-					geo_v,
+					geo_conditioning,
 					geo_memory_reliability_map,
 				)
 			else:
-				fused_desc, geo_reliability_map, gcdr_aux = self.pre_attn_refiner(fused_desc, geo_v)
+				fused_desc, geo_reliability_map, gcdr_aux = self.pre_attn_refiner(fused_desc, geo_conditioning)
 		desc = fused_desc
 
 		# 4. AFT descriptor context refinement
@@ -1304,17 +1150,13 @@ class FeatureBooster(nn.Module):
 		# 5. Final projection path
 		# Convert back to NCHW for final output
 		desc_map = desc.permute(0, 3, 1, 2)
-
-		# Final projection / activation
-		if self.last_activation is not None:
-			desc_map = self.last_activation(desc_map)
-
-		# Baseline LiftFeat enforces L2 normalization before returning descriptors
-		# L2 norm along channel dim=1 because desc_map is (B, C, H, W)
+		# Normalize descriptors along the channel dimension.
 		desc_map = F.normalize(desc_map, p=2, dim=1)
-		repeatability_map = self.repeatability_head(desc_map)
+		repeat_map = self.repeatability_head(desc_map) if self.repeatability_head is not None else None
 
 		aux_outputs = {}
+		if geo_branch_weights is not None:
+			aux_outputs['geo_branch_weights'] = geo_branch_weights
 		if geo_memory_reliability_map is not None:
 			aux_outputs['geo_memory_reliability_map'] = geo_memory_reliability_map
 		if geo_reliability_map is not None:
@@ -1329,7 +1171,7 @@ class FeatureBooster(nn.Module):
 			if texture_weakness is not None:
 				aux_outputs['texture_weakness_map'] = texture_weakness
 
-		return desc_map, repeatability_map, aux_outputs
+		return desc_map, repeat_map, aux_outputs
 
 class GeoFeatModel(nn.Module):
 	"""Main GeoFeat network.
@@ -1344,100 +1186,70 @@ class GeoFeatModel(nn.Module):
 	def __init__(self, model_config):
 		super().__init__()
 		self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		# Public config exposes only high-level options; internal architecture
-		# defaults remain private to this module.
-		from copy import deepcopy
-		self.model_config = deepcopy(FIXED_MODEL_CONFIG)
-		self.model_config.update(model_config)
-		self.model_config['geometric_features'] = dict(FIXED_MODEL_CONFIG['geometric_features'], **model_config['geometric_features'])
-		self.geo_config = self.model_config['geometric_features']
-
-		# Backbone extracts a three-level pyramid. Later fusion brings x4/x5 back
-		# to x3 resolution, so all heads predict on the same stride-8 grid.
-		self.backbone = self.model_config['backbone']
-		# Balanced compact default keeps the full mainline under 1M parameters.
-		# Archived wider checkpoints can restore their original channels through
-		# model_config['backbone_channels'].
-		backbone_channels = self.model_config['backbone_channels']
-		if len(backbone_channels) != 5:
-			raise ValueError(f"backbone_channels must contain 5 integers, got {backbone_channels}")
-		c1, c2, c3, c4, c5 = [int(v) for v in backbone_channels]
-		head_in_channels = int(self.model_config['head_in_channels'])
-		if self.backbone == "Standard":
-			self.feature_extract = StandardBackbone(c1, c2, c3, c4, c5)
-		elif self.backbone == "RepVGG":
-			self.feature_extract = RepVGGBackbone(c1, c2, c3, c4, c5)
+		if model_config['backbone'] == "Standard":
+			self.backbone = StandardBackbone()
+		elif model_config['backbone'] == "RepVGG":
+			self.backbone = RepVGGBackbone()
 		else:
-			raise ValueError(f"Unknown backbone: {self.backbone}")
+			raise ValueError(f"Unknown backbone: {model_config['backbone']}")
+		x3_channels, x4_channels, x5_channels = self.backbone.output_channels
 		self.norm = nn.InstanceNorm2d(1)
 
 		# FPN-style top-down fusion: x5 -> x4 -> x3.
-		self.upsample4 = UpsampleLayer(c4)
-		self.upsample5 = UpsampleLayer(c5)
+		self.upsample4 = UpsampleLayer(x4_channels)
+		self.upsample5 = UpsampleLayer(x5_channels)
 
-		self.conv_fusion45 = nn.Conv2d(c5//2+c4,c4,kernel_size=3,stride=1,padding=1)
-		self.conv_fusion34 = nn.Conv2d(c4//2+c3,head_in_channels,kernel_size=3,stride=1,padding=1)
+		self.conv_fusion45 = nn.Conv2d(
+			x5_channels // 2 + x4_channels,
+			x4_channels,
+			kernel_size=3,
+			stride=1,
+			padding=1,
+		)
+		self.conv_fusion34 = nn.Conv2d(
+			x4_channels // 2 + x3_channels,
+			x3_channels,
+			kernel_size=3,
+			stride=1,
+			padding=1,
+		)
 
 		# Dense prediction heads on the fused stride-8 feature map.
-		self.keypoint_dim = self.model_config['keypoint_dim']
 		self.keypoint_head = KeypointHead(
-			in_channels=head_in_channels,
-			out_channels=self.keypoint_dim,
-			hidden_channels=self.model_config['keypoint_head_channels'],
+			in_channels=x3_channels,
+			out_channels=model_config['keypoint_dim'],
 		)
 		# descriptor
-		self.descriptor_dim = self.model_config['descriptor_dim']
 		self.descriptor_head = DescriptorHead(
-			in_channels=head_in_channels,
-			out_channels=self.descriptor_dim,
-			hidden_channels=self.model_config['descriptor_head_channels'],
+			in_channels=x3_channels,
+			out_channels=model_config['descriptor_dim'],
 		)
 		# geometric features
-		self.geo_head = None if not any(bool(v) for k, v in self.geo_config.items() if k != 'normal') else GeoHead(in_channels=head_in_channels, geo_cfg=self.geo_config)
+		self.geo_config = model_config['geometric_features']
+		self.geo_head = None if not any(bool(v) for v in self.geo_config.values()) else GeoHead(in_channels=x3_channels, geo_cfg=self.geo_config)
+		self.repeatability_enabled = model_config['repeatability_enabled']
 		# # heatmap
 		# self.heatmap_head = HeatmapHead(in_channels=c3, mid_channels=c3,out_channels=1)
 
-		# repeatability_alpha blends detector logits with repeatability logits.
-		# Optional adaptive knobs are injected by wrapper/evaluation code.
-		self.repeatability_alpha = self.model_config['repeatability_alpha']
-		self.repeatability_adaptive_gamma = float(self.model_config['repeatability_adaptive_gamma'])
-		self.descriptor_confidence_gain = float(self.model_config['descriptor_confidence_gain'])
-		self.geo_preprocess_mode = self.model_config['geo_preprocess_mode']
-		self.repeatability_proj = nn.Conv2d(1, self.keypoint_dim, kernel_size=1, bias=True)
+		self.repeatability_proj = nn.Conv2d(1, model_config['keypoint_dim'], kernel_size=1, bias=True) if self.repeatability_enabled else None
 
-		self.attn_fusion = FeatureBooster(self.model_config)
-		self.attn_fusion.validate_refiner_configuration()
+		self.attn_fusion = FeatureBooster(model_config)
 
 	def fuse_multi_features(self,x3,x4,x5):
-		"""Fuse backbone pyramid features into one stride-8 feature map."""
-		# Upsample x5 to x4 resolution and fuse semantic context into x4.
+		# upsample x5 feature
 		x5 = self.upsample5(x5)
-		# align spatial size to x4 to avoid cat mismatch when input H/W not divisible by 32
-		if x5.shape[-2:] != x4.shape[-2:]:
+		if x5.shape[-2:] != x4.shape[-2:]:		# Pooling rounding may cause deviation, align to x4 before stitching
 			x5 = F.interpolate(x5, size=x4.shape[-2:], mode='bilinear', align_corners=False)
-		x4 = torch.cat([x4, x5], dim=1)
+		x4 = torch.cat([x4,x5],dim=1)
 		x4 = self.conv_fusion45(x4)
 
-		# Upsample fused x4 to x3 resolution for dense heads.
+		# upsample x4 feature
 		x4 = self.upsample4(x4)
-		# align spatial size to x3 before concat
-		if x4.shape[-2:] != x3.shape[-2:]:
+		if x4.shape[-2:] != x3.shape[-2:]:		# Pooling rounding may cause deviation, align to x3 before stitching
 			x4 = F.interpolate(x4, size=x3.shape[-2:], mode='bilinear', align_corners=False)
-		x3 = torch.cat([x3, x4], dim=1)
+		x3 = torch.cat([x3,x4],dim=1)
 		x = self.conv_fusion34(x3)
 		return x
-
-	def _unfold2d(self, x, ws = 2):
-		"""
-			Unfold a geometry/image-level tensor into non-overlapping windows.
-
-			For ws=8, (B, C, H, W) becomes (B, C*64, H/8, W/8), preserving local
-			geometry patches as channel tokens aligned with descriptor cells.
-		"""
-		B, C, H, W = x.shape
-		x = x.unfold(2,  ws , ws).unfold(3, ws,ws).reshape(B, C, H//ws, W//ws, ws**2)
-		return x.permute(0, 1, 4, 2, 3).reshape(B, -1, H//ws, W//ws)
-
 
 	def forward1(self, x):
 		"""
@@ -1457,7 +1269,7 @@ class GeoFeatModel(nn.Module):
 			x = x.mean(dim=1, keepdim = True)
 			x = self.norm(x)
 
-		x3, x4, x5 = self.feature_extract(x)
+		x3, x4, x5 = self.backbone(x)
 
 		# features fusion
 		x = self.fuse_multi_features(x3, x4, x5)
@@ -1473,103 +1285,282 @@ class GeoFeatModel(nn.Module):
 
 		return keypoint_map, des_map, geo_map
 
-	def forward2(self, keypoint_map, des_map, geo_map, return_refined_keypoints: bool = True, return_aux: bool = False):
-		"""Stage 2: geometry-aware descriptor/keypoint refinement.
-
-		Args:
-			keypoint_map: Raw detector logits from forward1.
-			des_map: Raw dense descriptor map from forward1.
-			geo_map: Geometry map from forward1.
-			return_refined_keypoints: If true, also return refined detector logits.
-			return_aux: If true, include repeatability/reliability diagnostic maps.
-		"""
-		# Pass feature maps directly to FeatureBooster:
-		# - des_map: (B, C_desc, H/8, W/8)
-		# - keypoint_map: (B, C_kpt, H/8, W/8)
-		# - geo_map is either unfolded to descriptor resolution or resized directly.
-		# no_unfold_lite is preferred when geometry already includes normals,
-		# gradients, and curvatures. The legacy unfold path was designed to enrich
-		# depth-only geometry; with richer derivative geometry it can add redundant
-		# channels and noise.
-		if geo_map is None:
-			processed_geo_map = None
-		elif self.geo_preprocess_mode == 'unfold':
-			# Legacy path: keep each 8x8 geometry patch as channels aligned to one
-			# descriptor cell. More expressive, but heavier and noisier.
-			processed_geo_map = self._unfold2d(geo_map, ws=8)
-		else:
-			# Mainline path: geometry derivatives are already semantically dense, so
-			# direct resizing is cheaper and avoids redundant patch channels.
-			processed_geo_map = F.interpolate(
+	def forward2(self, keypoint_map, des_map, geo_map, return_logits: bool = True, return_aux: bool = False):
+		"""Refine descriptors and blend keypoint logits with repeatability."""
+		if geo_map is not None:
+			geo_map = F.interpolate(
 				geo_map,
 				size=des_map.shape[-2:],
 				mode='bilinear',
 				align_corners=False,
 			)
 
-		descs_refine, repeatability_map, aux_outputs = self.attn_fusion(des_map, keypoint_map, processed_geo_map)
-
-		def _repeatability_confidence(rep_map, gamma):
-			"""Convert repeatability prediction into a confidence map for blending."""
-			if gamma <= 0:
-				return torch.sigmoid(rep_map)
-			centered = rep_map - rep_map.mean(dim=(2, 3), keepdim=True)
-			return torch.sigmoid(centered * gamma)
-
-		confidence_map = _repeatability_confidence(
-			repeatability_map,
-			self.repeatability_adaptive_gamma,
-		)
-		geometry_keypoint_reliability = aux_outputs['geo_joint_reliability_map'] if 'geo_joint_reliability_map' in aux_outputs else None
-		if geometry_keypoint_reliability is None:
-			geometry_keypoint_reliability = aux_outputs['geo_reliability_map'] if 'geo_reliability_map' in aux_outputs else None
-		if geometry_keypoint_reliability is not None:
-			if geometry_keypoint_reliability.shape[-2:] != confidence_map.shape[-2:]:
-				geometry_keypoint_reliability = F.interpolate(
-					geometry_keypoint_reliability,
-					size=confidence_map.shape[-2:],
-					mode='bilinear',
-					align_corners=False,
-				)
-			confidence_map = confidence_map * geometry_keypoint_reliability.clamp(0.0, 1.0)
-
-		if self.descriptor_confidence_gain > 0:
-			# Optional inference-time safeguard: blend refined descriptors with raw
-			# descriptors where repeatability confidence is low.
-			raw_desc_map = F.normalize(des_map, p=2, dim=1)
-			weight_map = (confidence_map * self.descriptor_confidence_gain).clamp(0.0, 1.0)
-			descs_refine = F.normalize((1.0 - weight_map) * raw_desc_map + weight_map * descs_refine, p=2, dim=1)
-
-		repeatability_logits = self.repeatability_proj(repeatability_map)
-		alpha = float(self.repeatability_alpha)
-		if self.repeatability_adaptive_gamma > 0:
-			# Adaptive alpha makes repeatability influence stronger only where its
-			# confidence is high, preserving raw detector logits elsewhere.
-			alpha_map = (alpha * confidence_map).clamp(0.0, 1.0)
-			keypoint_logits_refined = (1.0 - alpha_map) * keypoint_map + alpha_map * repeatability_logits
-		else:
-			keypoint_logits_refined = (1.0 - alpha) * keypoint_map + alpha * repeatability_logits
+		desc, repeat_map, aux_outputs = self.attn_fusion(des_map, keypoint_map, geo_map)
+		kpt_logits = keypoint_map
+		if self.repeatability_enabled:
+			repeat_logits = self.repeatability_proj(repeat_map)
+			alpha = 0.35
+			if self.attn_fusion.pre_attn_refiner is not None:
+				# Unfloored reliability limits feedback; ablations keep visual-only fusion.
+				alpha = alpha * aux_outputs['geo_reliability_map']
+			kpt_logits = (1.0 - alpha) * keypoint_map + alpha * repeat_logits
 
 		if return_aux:
 			aux_outputs = dict(aux_outputs)
-			aux_outputs['repeatability_map'] = repeatability_map
-			aux_outputs['repeatability_confidence_map'] = confidence_map
-			if geometry_keypoint_reliability is not None:
-				aux_outputs['geometry_keypoint_reliability_map'] = geometry_keypoint_reliability
-			aux_outputs['keypoint_logits_refined'] = keypoint_logits_refined
-			if return_refined_keypoints:
-				return descs_refine, keypoint_logits_refined, aux_outputs
-			return descs_refine, aux_outputs
+			# Training callers omit repeatability supervision when this key is absent.
+			if repeat_map is not None:
+				aux_outputs['repeat_map'] = repeat_map
+			aux_outputs['kpt_logits'] = kpt_logits
+			if return_logits:
+				return desc, kpt_logits, aux_outputs
+			return desc, aux_outputs
 
-		if return_refined_keypoints:
-			return descs_refine, keypoint_logits_refined
-		return descs_refine
+		if return_logits:
+			return desc, kpt_logits
+		return desc
 
 	def forward(self,x):
 		"""Convenience full forward used by legacy callers."""
 		keypoint_map, des_map, geo_map = self.forward1(x)
-		descs_refine = self.forward2(keypoint_map, des_map, geo_map, return_refined_keypoints=True)
-		return descs_refine, des_map, geo_map, keypoint_map
+		desc = self.forward2(keypoint_map, des_map, geo_map, return_logits=False)
+		return desc, keypoint_map, des_map, geo_map
+
+
+class GeoFeat(pl.LightningModule):
+	"""Lightning training module configured by ``src/config/train.yaml``."""
+
+	def __init__(self, backbone: str, keypoint_dim: int, descriptor_dim: int,
+				 optimizer: dict[str, Any], scheduler: dict[str, Any],
+				 ablation: dict[str, bool]) -> None:
+		super().__init__()
+		self.save_hyperparameters()
+		disable_geo_head = ablation["disable_geo_head"]
+		disable_gcdr = ablation["disable_gcdr"] or disable_geo_head
+		disable_repeatability = ablation["disable_repeatability"] or disable_gcdr
+		effective_ablation = {
+			"disable_geo_head": disable_geo_head,
+			"disable_gcdr": disable_gcdr,
+			"disable_repeatability": disable_repeatability,
+		}
+		self.model_config = {
+			"backbone": backbone,
+			"keypoint_dim": keypoint_dim,
+			"descriptor_dim": descriptor_dim,
+			"ablation": effective_ablation,
+			"refiner_type": "GCDR" if not disable_gcdr else "None",
+			"geometric_features": {
+				"depth": not disable_geo_head,
+				"gradients": not disable_geo_head,
+				"normals": not disable_geo_head,
+				"curvatures": not disable_geo_head,
+			},
+			"repeatability_enabled": not disable_repeatability,
+		}
+		self.optimizer_config = optimizer
+		self.scheduler_config = scheduler
+		self.net = GeoFeatModel(self.model_config)
+		self.loss_fn: GeoFeatLoss | None = None
+		self.depth_net: DepthAnythingExtractor | None = None
+		self.dam_geometry_extractor: Any = None
+		self.alike_net: ALikeExtractor | None = None
+		self.save_ckpt_every = 1000
+		self.use_dual_kpt_loss = True
+		self.kpt_raw_weight_start = 0.8
+		self.kpt_raw_weight_end = 0.2
+		self.kpt_refined_weight_start = 0.2
+		self.kpt_refined_weight_end = 0.8
+		self.kpt_ramp_steps = 40_000
+		self.homography_difficulty_start = 0.10
+		self.homography_difficulty_end = 0.10
+		self.homography_ramp_steps = 1
+		self.tps_probability = 0.70
+
+	def setup(self, stage: str) -> None:
+		if stage != "fit":
+			return
+		device = self.device
+		loss_cfg = get_loss_config()
+		self.loss_fn = GeoFeatLoss(
+			device, self.model_config["geometric_features"],
+			lam_descs=1, lam_fb_descs=3, lam_kpts=2, lam_kpts_raw=5,
+			lam_heatmap=1,
+			lam_reliability=loss_cfg["reliability_loss_weight"] if self.model_config["refiner_type"] == "GCDR" else 0,
+			lam_repeatability=loss_cfg["repeatability_loss_weight"] if self.model_config["repeatability_enabled"] else 0,
+			lam_depth=loss_cfg["depth_weight"] if self.model_config["geometric_features"]["depth"] else 0,
+			lam_gradients=loss_cfg["gradient_weight"] if self.model_config["geometric_features"]["gradients"] or self.model_config["geometric_features"]["normals"] else 0,
+			lam_curvature=loss_cfg["curvature_weight"] if self.model_config["geometric_features"]["curvatures"] else 0,
+			lam_descriptor_protect=loss_cfg["descriptor_protect_weight"],
+			lam_reliable_enhance=loss_cfg["reliable_enhance_weight"],
+			lam_unreliable_suppress=loss_cfg["unreliable_suppress_weight"],
+			reliable_enhance_margin=loss_cfg["reliable_enhance_margin"],
+			reliable_enhance_threshold=loss_cfg["reliable_enhance_threshold"],
+			reliable_enhance_quantile=loss_cfg["reliable_enhance_quantile"],
+			unreliable_suppress_threshold=loss_cfg["unreliable_suppress_threshold"],
+			unreliable_suppress_quantile=loss_cfg["unreliable_suppress_quantile"],
+			reliability_consistency_weight=loss_cfg["reliability_consistency_weight"],
+			reliability_target_scale=loss_cfg["reliability_target_scale"],
+			geo_loss_reliability_weighted=loss_cfg["geo_loss_reliability_weighted"],
+			geo_loss_unreliable_floor=loss_cfg["geo_loss_unreliable_floor"],
+		).to(device)
+		self.depth_net = DepthAnythingExtractor("vits", device, 256)
+		self.dam_geometry_extractor = GeometricExtractor(
+			model_config=self.model_config, device=device, enable_depth_extractor=False
+		).to(device).eval()
+		self.alike_net = ALikeExtractor("alike-t", device).eval()
+		self.alike_net.requires_grad_(False)
+
+	def _data_module(self):
+		return self.trainer.datamodule
+
+	def _kpt_weights(self, step: int) -> tuple[float, float]:
+		if not self.use_dual_kpt_loss or step > self.kpt_ramp_steps:
+			return 0.2, 0.8
+		ratio = min(max(step - 1, 0) / max(self.kpt_ramp_steps - 1, 1), 1.0)
+		raw = self.kpt_raw_weight_start + ratio * (self.kpt_raw_weight_end - self.kpt_raw_weight_start)
+		refined = self.kpt_refined_weight_start + ratio * (self.kpt_refined_weight_end - self.kpt_refined_weight_start)
+		return raw / (raw + refined), refined / (raw + refined)
+
+	def _build_training_batch(self):
+		dm = self._data_module()
+		images0, images1, np0, np1, positives = [], [], [], [], []
+		if dm.use_coco:
+			coco0, coco1, h0, h1 = dm.make_coco_batch(
+				self.homography_difficulty_start, self.tps_probability
+			)
+			hc, wc = coco0.shape[-2] // 8, coco0.shape[-1] // 8
+			_, coco_pos = dm.get_corresponding_points(coco0, coco1, h0, h1, hc, wc)
+			images0.append(coco0.mean(1, keepdim=True))
+			images1.append(coco1.mean(1, keepdim=True))
+			positives += coco_pos
+		if dm.use_megadepth:
+			batch = dm.next_megadepth_batch()
+			for key in batch:
+				if isinstance(batch[key], torch.Tensor):
+					batch[key] = batch[key].to(self.device)
+			images0.append(batch["image0"].mean(1, keepdim=True))
+			images1.append(batch["image1"].mean(1, keepdim=True))
+			for index in range(batch["image0_np"].shape[0]):
+				np0.append(batch["image0_np"][index].squeeze(0).cpu().numpy())
+				np1.append(batch["image1_np"][index].squeeze(0).cpu().numpy())
+			positives += megadepth_wrapper.spvs_coarse(batch, 8)
+		return torch.cat(images0), torch.cat(images1), np0, np1, positives
+
+	def _forward_pair(self, image0: torch.Tensor, image1: torch.Tensor):
+		key0, desc0, geo0 = self.net.forward1(image0)
+		key1, desc1, geo1 = self.net.forward1(image1)
+		feedback0, feedback1 = [], []
+		refined0, refined1 = [], []
+		reliability0, reliability1 = [], []
+		repeatability0, repeatability1 = [], []
+		alike0, alike1 = [], []
+
+		for index in range(desc0.shape[0]):
+			output0 = self.net.forward2(
+				key0[index:index + 1], desc0[index:index + 1],
+				geo0[index:index + 1] if geo0 is not None else None,
+				return_logits=True, return_aux=True,
+			)
+			output1 = self.net.forward2(
+				key1[index:index + 1], desc1[index:index + 1],
+				geo1[index:index + 1] if geo1 is not None else None,
+				return_logits=True, return_aux=True,
+			)
+			feedback0.append(output0[0])
+			refined0.append(output0[1])
+			feedback1.append(output1[0])
+			refined1.append(output1[1])
+			self._append_auxiliary_outputs(output0[2], reliability0, repeatability0)
+			self._append_auxiliary_outputs(output1[2], reliability1, repeatability1)
+
+			image0_np = image0[index].permute(1, 2, 0).expand(-1, -1, 3).detach().cpu().numpy() * 255
+			image1_np = image1[index].permute(1, 2, 0).expand(-1, -1, 3).detach().cpu().numpy() * 255
+			alike0.append(torch.as_tensor(self.alike_net.extract_alike_kpts(image0_np), device=self.device))
+			alike1.append(torch.as_tensor(self.alike_net.extract_alike_kpts(image1_np), device=self.device))
+
+		return {
+			"raw_keypoints0": key0,
+			"raw_keypoints1": key1,
+			"raw_descriptors0": desc0,
+			"raw_descriptors1": desc1,
+			"geometry0": geo0,
+			"geometry1": geo1,
+			"feedback0": torch.cat(feedback0),
+			"feedback1": torch.cat(feedback1),
+			"refined0": torch.cat(refined0),
+			"refined1": torch.cat(refined1),
+			"reliability0": torch.cat(reliability0) if reliability0 else None,
+			"reliability1": torch.cat(reliability1) if reliability1 else None,
+			"repeatability0": torch.cat(repeatability0) if repeatability0 else None,
+			"repeatability1": torch.cat(repeatability1) if repeatability1 else None,
+			"alike0": alike0,
+			"alike1": alike1,
+		}
+
+	@staticmethod
+	def _append_auxiliary_outputs(auxiliary: dict[str, torch.Tensor], reliability: list, repeatability: list) -> None:
+		if "geo_joint_reliability_map" in auxiliary:
+			reliability.append(auxiliary["geo_joint_reliability_map"])
+		elif "geo_reliability_map" in auxiliary:
+			reliability.append(auxiliary["geo_reliability_map"])
+		if "repeat_map" in auxiliary:
+			repeatability.append(auxiliary["repeat_map"])
+
+	def _build_loss_info(self, outputs: dict[str, Any], positives: list, geometry_targets0: list, geometry_targets1: list):
+		dm = self._data_module()
+		raw_weight, refined_weight = self._kpt_weights(self.global_step + 1)
+		return self.loss_fn(
+			outputs["raw_descriptors0"], outputs["feedback0"], outputs["refined0"], outputs["geometry0"],
+			outputs["raw_descriptors1"], outputs["feedback1"], outputs["refined1"], outputs["geometry1"],
+			positives, outputs["alike0"], outputs["alike1"], [], [], geometry_targets0, geometry_targets1,
+			dm.megadepth_batch_size, dm.coco_batch_size,
+			reliability1=outputs["reliability0"], reliability2=outputs["reliability1"],
+			repeatability1=outputs["repeatability0"], repeatability2=outputs["repeatability1"],
+			raw_kpts1=outputs["raw_keypoints0"], raw_kpts2=outputs["raw_keypoints1"],
+			refined_kpts1=outputs["refined0"], refined_kpts2=outputs["refined1"],
+			use_dual_kpt_loss=True, kpt_raw_weight=raw_weight,
+			kpt_refined_weight=refined_weight, kpt_single_source="raw",
+		)
+
+	def _loss_terms(self, loss_info: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+		loss_names = ["loss_descs", "loss_fb_descs", "loss_kpts", "loss_descriptor_protect"]
+		if self.model_config["refiner_type"] == "GCDR":
+			loss_names += ["loss_reliability", "loss_reliable_enhance", "loss_unreliable_suppress"]
+		if self.model_config["repeatability_enabled"]:
+			loss_names.append("loss_repeatability")
+		if self.model_config["geometric_features"]["depth"]:
+			loss_names.append("loss_depths")
+		if self.model_config["geometric_features"]["gradients"] or self.model_config["geometric_features"]["normals"]:
+			loss_names.append("loss_gradients")
+		if self.model_config["geometric_features"]["curvatures"]:
+			loss_names.append("loss_curvature")
+		return [loss_info[name] for name in loss_names]
+
+	def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
+		del batch, batch_idx
+		images0, images1, np0, np1, positives = self._build_training_batch()
+		if any(len(points) < 30 for points in positives):
+			return torch.zeros((), device=self.device, requires_grad=True)
+		outputs = self._forward_pair(images0, images1)
+		if self.model_config["geometric_features"]["depth"]:
+			geometry_targets0 = [self.depth_net.extract(image, geometric_extractor=self.dam_geometry_extractor) for image in np0]
+			geometry_targets1 = [self.depth_net.extract(image, geometric_extractor=self.dam_geometry_extractor) for image in np1]
+		else:
+			geometry_targets0 = []
+			geometry_targets1 = []
+		loss_info = self._build_loss_info(outputs, positives, geometry_targets0, geometry_targets1)
+		loss = torch.stack(self._loss_terms(loss_info)).mean()
+		self.log("loss", loss, on_step=True, on_epoch=False, logger=True, prog_bar=True)
+		self.log("Step", self.global_step + 1, on_step=True, on_epoch=False, logger=False, prog_bar=True)
+		self.log("Loss/total", loss, on_step=True, on_epoch=False, logger=True)
+		self.log("acc_fb_coarse", loss_info["acc_fb_coarse"], on_step=True, on_epoch=False, logger=True)
+		return loss
+
+	def configure_optimizers(self):
+		optimizer_name = self.optimizer_config["name"]
+		optimizer = {"Adam": torch.optim.Adam, "AdamW": torch.optim.AdamW}[optimizer_name](self.net.parameters(), lr=self.optimizer_config["lr"])
+		scheduler_name = self.scheduler_config["name"]
+		scheduler = {"StepLR": torch.optim.lr_scheduler.StepLR}[scheduler_name](optimizer, step_size=self.scheduler_config["step_size"], gamma=self.scheduler_config["gamma"])
+		return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
 
 if __name__ == "__main__":
@@ -1598,7 +1589,7 @@ if __name__ == "__main__":
 
 	geofeat_sp=GeoFeatModel(model_config=model_config).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 	keypoint_map, des_map, geo_map = geofeat_sp.forward1(img)
-	des_fine=geofeat_sp.forward2(keypoint_map, des_map, geo_map, return_refined_keypoints=False)
+	des_fine=geofeat_sp.forward2(keypoint_map, des_map, geo_map, return_logits=False)
 	if isinstance(des_fine, tuple):
 		des_fine = des_fine[0]
 	print(f"Output descriptor shape: {des_fine.shape}")

@@ -1,36 +1,34 @@
-@INPROCEEDINGS{LiftFeat,
+@inproceedings{LiftFeat,
   author={Liu, Yepeng and Lai, Wenpeng and Zhao, Zhou and Xiong, Yuxuan and Zhu, Jinchi and Cheng, Jun and Xu, Yongchao},
-  booktitle={2025 IEEE International Conference on Robotics and Automation (ICRA)}, 
-  title={LiftFeat: 3D Geometry-Aware Local Feature Matching}, 
+  booktitle={2025 IEEE International Conference on Robotics and Automation (ICRA)},
+  title={{LiftFeat}: {3D} Geometry-Aware Local Feature Matching},
   year={2025},
-  volume={},
-  number={},
-  pages={11714-11720},
+  pages={11714--11720},
   doi={10.1109/ICRA55743.2025.11127853}
 }
 
 @inproceedings{schoenberger2016sfm,
     author={Sch\"{o}nberger, Johannes Lutz and Frahm, Jan-Michael},
     title={Structure-from-Motion Revisited},
-    booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+    booktitle={Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
     year={2016},
 }
 
 @inproceedings{schoenberger2016mvs,
     author={Sch\"{o}nberger, Johannes Lutz and Zheng, Enliang and Pollefeys, Marc and Frahm, Jan-Michael},
     title={Pixelwise View Selection for Unstructured Multi-View Stereo},
-    booktitle={European Conference on Computer Vision (ECCV)},
+    booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
     year={2016},
 }
 
 @article{JIANG2020230,
-    title = {Efficient structure from motion for large-scale UAV images: A review and a comparison of SfM tools},
+    title = {Efficient structure from motion for large-scale {UAV} images: A review and a comparison of {SfM} tools},
     journal = {ISPRS Journal of Photogrammetry and Remote Sensing},
     volume = {167},
-    pages = {230-251},
+    pages = {230--251},
     year = {2020},
     issn = {0924-2716},
-        doi = {https://doi.org/10.1016/j.isprsjprs.2020.04.016},
+        doi = {10.1016/j.isprsjprs.2020.04.016},
     url = {https://www.sciencedirect.com/science/article/pii/S0924271620301131},
     author = {San Jiang and Cheng Jiang and Wanshou Jiang},
     keywords = {Unmanned aerial vehicle, Structure-from-motion, Bundle adjustment, Match pair selection, Outlier removal, Divide-and-conquer},
@@ -39,7 +37,7 @@
 
 
 @misc{zhao_efficient_2025,
-	title = {Efficient Physics Simulation for 3D Scenes via {MLLM}-Guided Gaussian Splatting},
+	title = {Efficient Physics Simulation for {3D} Scenes via {MLLM}-Guided Gaussian Splatting},
 	url = {http://arxiv.org/abs/2411.12789},
 	doi = {10.48550/arXiv.2411.12789},
 	abstract = {Recent advancements in 3D generation models have opened new possibilities for simulating dynamic 3D object movements and customizing behaviors, yet creating this content remains challenging. Current methods often require manual assignment of precise physical properties for simulations or rely on video generation models to predict them, which is computationally intensive. In this paper, we rethink the usage of multi-modal large language model ({MLLM}) in physics-based simulation, and present Sim Anything, a physics-based approach that endows static 3D objects with interactive dynamics. We begin with detailed scene reconstruction and object-level 3D open-vocabulary segmentation, progressing to multi-view image in-painting. Inspired by human visual reasoning, we propose {MLLM}-based Physical Property Perception ({MLLM}-P3) to predict mean physical properties of objects in a zero-shot manner. Based on the mean values and the object's geometry, the Material Property Distribution Prediction model ({MPDP}) model then estimates the full distribution, reformulating the problem as probability distribution estimation to reduce computational costs. Finally, we simulate objects in an open-world scene with particles sampled via the Physical-Geometric Adaptive Sampling ({PGAS}) strategy, efficiently capturing complex deformations and significantly reducing computational costs. Extensive experiments and user studies demonstrate our Sim Anything achieves more realistic motion than state-of-the-art methods within 2 minutes on a single {GPU}.},
@@ -47,21 +45,21 @@
 	publisher = {{arXiv}},
 	author = {Zhao, Haoyu and Wang, Hao and Zhao, Xingyue and Fei, Hao and Wang, Hongqiu and Long, Chengjiang and Zou, Hua},
 	urldate = {2026-01-05},
-	date = {2025-07-26},
-	eprinttype = {arxiv},
-	eprint = {2411.12789 [cs]},
+	year = {2025},
+	archivePrefix = {arXiv},
+	eprint = {2411.12789},
 	keywords = {Computer Science - Computer Vision and Pattern Recognition},
 	file = {Preprint PDF:C\:\\Users\\shi-jia-liang\\Zotero\\storage\\B8353L6Y\\Zhao 等 - 2025 - Efficient Physics Simulation for 3D Scenes via MLLM-Guided Gaussian Splatting.pdf:application/pdf},
 }
 
-@ARTICLE{4160954,
+@article{4160954,
   author={Davison, Andrew J. and Reid, Ian D. and Molton, Nicholas D. and Stasse, Olivier},
-  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence}, 
-  title={MonoSLAM: Real-Time Single Camera SLAM}, 
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  title={{MonoSLAM}: Real-Time Single Camera {SLAM}},
   year={2007},
   volume={29},
   number={6},
-  pages={1052-1067},
+  pages={1052--1067},
   keywords={Cameras;Simultaneous localization and mapping;Robot vision systems;Layout;Mobile robots;Real time systems;Motion measurement;Motion estimation;Robustness;Hardware;Autonomous vehicles;3D/stereo scene analysis;tracking.},
   doi={10.1109/TPAMI.2007.1049}}
 
@@ -75,32 +73,342 @@
 	shorttitle = {{MonoSLAM}},
 	pages = {1052--1067},
 	number = {6},
-	journaltitle = {{IEEE} Transactions on Pattern Analysis and Machine Intelligence},
+	journal = {{IEEE} Transactions on Pattern Analysis and Machine Intelligence},
 	author = {Davison, Andrew J. and Reid, Ian D. and Molton, Nicholas D. and Stasse, Olivier},
 	urldate = {2026-01-05},
-	date = {2007-06},
+	year = {2007},
 	keywords = {3D/stereo scene analysis, Autonomous vehicles, Cameras, Hardware, Layout, Mobile robots, Motion estimation, Motion measurement, Real time systems, Robot vision systems, Robustness, Simultaneous localization and mapping, tracking.},
 }
 
 @article{ORBSLAM3_TRO,
-  title={{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial 
+  title={{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial
            and Multi-Map {SLAM}},
-  author={Campos, Carlos AND Elvira, Richard AND G\´omez, Juan J. AND Montiel, 
+  author={Campos, Carlos AND Elvira, Richard AND G{\'o}mez, Juan J. AND Montiel,
           Jos\'e M. M. AND Tard\'os, Juan D.},
-  journal={IEEE Transactions on Robotics}, 
+  journal={IEEE Transactions on Robotics},
   volume={37},
   number={6},
-  pages={1874-1890},
+  pages={1874--1890},
   year={2021}
  }
 
 @article{Orb-slam2,
-  title={Orb-slam2: An open-source slam system for monocular, stereo, and rgb-d cameras},
+  title={{ORB-SLAM2}: An Open-Source {SLAM} System for Monocular, Stereo, and {RGB-D} Cameras},
   author={Mur-Artal, Raul and Tard{\'o}s, Juan D},
-  journal={IEEE transactions on robotics},
+  journal={IEEE Transactions on Robotics},
   volume={33},
   number={5},
   pages={1255--1262},
   year={2017},
   publisher={IEEE}
+}
+
+@inproceedings{Zeng2017_3DMatch,
+  author={Zeng, Andy and Song, Shuran and Nie{\ss}ner, Matthias and Fisher, Matthew and Xiao, Jianxiong and Funkhouser, Thomas},
+  title={{3DMatch}: Learning Local Geometric Descriptors from {RGB-D} Reconstructions},
+  booktitle={Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2017},
+  pages={1802--1811},
+  doi={10.1109/CVPR.2017.195}
+}
+
+@inproceedings{Yew2018_3DFeatNet,
+  author={Yew, Zi Jian and Lee, Gim Hee},
+  title={{3DFeat-Net}: Weakly Supervised Local {3D} Features for Point Cloud Registration},
+  booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
+  year={2018},
+  pages={607--623},
+  doi={10.1007/978-3-030-01270-0_36}
+}
+
+@inproceedings{Perez2018FiLM,
+  author={Perez, Ethan and Strub, Florian and de Vries, Harm and Dumoulin, Vincent and Courville, Aaron},
+  title={{FiLM}: Visual Reasoning with a General Conditioning Layer},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  year={2018},
+  volume={32},
+  number={1},
+  doi={10.1609/aaai.v32i1.11671}
+}
+
+@inproceedings{MambaGlue2025,
+  author={Ryoo, Kihwan and Lim, Hyungtae and Myung, Hyun},
+  title={{MambaGlue}: Fast and Robust Local Feature Matching with {Mamba}},
+  booktitle={2025 IEEE International Conference on Robotics and Automation (ICRA)},
+  year={2025},
+  pages={5758--5765},
+  doi={10.1109/ICRA55743.2025.11128473}
+}
+
+@article{Lu2026Matchability,
+  author={Lu, Xiaoyong and Du, Songlin and Xiao, Guobao and Wen, Guanghui},
+  title={Progressive Matchability Guided Hybrid Interaction for Latency-balanced Local Feature Matching},
+  journal={IEEE Transactions on Multimedia},
+  year={2026},
+  pages={1--11},
+  doi={10.1109/TMM.2026.3723600}
+}
+
+@inproceedings{Shi2026SemLight,
+  author={Shi, Guanglu and Liu, Xiangzeng and Li, Yunan and Pang, Tuo and Miao, Qiguang},
+  title={{SemLight}: Distilled Semantic--Geometric Fusion for Efficient Local Feature Matching},
+  booktitle={Computer Vision -- ECCV 2026},
+  year={2026},
+  pages={442--459},
+  doi={10.1007/978-3-032-37592-6_26}
+}
+
+@article{Rajyaguru2026PolarDepth,
+  author={Rajyaguru, Naitri and Wang, Tianfu and Tajne, Aryan and He, Botao and Wu, Jiayi and Fermuller, Cornellia and Metzler, Christopher and Aloimonos, Yiannis},
+  title={{PolarDepth}: Polarization-Guided Monocular Depth for Visual Odometry},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={6},
+  pages={7572--7579},
+  year={2026},
+  doi={10.1109/LRA.2026.3685941}
+}
+
+@article{Huang2026CUEMP,
+  author={Huang, Yucheng and Ji, Luping and Sun, Jiayuan and Jiang, Xiangwei and Liu, Hudong},
+  title={{CUEMP}: Correspondence Uncertainty Estimation With Motion Priors for Dense Visual Odometry},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={4},
+  pages={4497--4504},
+  year={2026},
+  doi={10.1109/LRA.2026.3666386}
+}
+
+@article{Li2026MVOFormer,
+  author={Li, Jituo and Sun, Shunwang and Zhang, Jialu and Liu, Xinqi and Hu, Jinyao and Lu, Zhicheng and Saeedi, Sajad and Lu, Guodong},
+  title={{MVOFormer}: Flow-Semantic Transformer for Robust Monocular Visual Odometry},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={8},
+  pages={9668--9675},
+  year={2026},
+  doi={10.1109/LRA.2026.3707361}
+}
+
+@article{Ren2026DepthCamera,
+  author={Ren, Yifei and Vitiello, Pietro and Johns, Edward},
+  title={Depth Camera or {RGB-to-Depth}? A Study of {RGB-to-Depth} Estimation for Robot Policy Learning},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={11},
+  pages={12887--12894},
+  year={2026},
+  doi={10.1109/LRA.2026.3734880}
+}
+
+@inproceedings{Sarlin2020SuperGlue,
+  author={Sarlin, Paul-Edouard and DeTone, Daniel and Malisiewicz, Tomasz and Rabinovich, Andrew},
+  title={{SuperGlue: Learning Feature Matching With Graph Neural Networks}},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2020},
+  pages={4938--4947}
+}
+
+@inproceedings{Lindenberger2023LightGlue,
+  author={Lindenberger, Philipp and Sarlin, Paul-Edouard and Pollefeys, Marc},
+  title={{LightGlue: Local Feature Matching at Light Speed}},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  year={2023},
+  pages={17627--17638}
+}
+
+@inproceedings{DeTone2018SuperPoint,
+  author={DeTone, Daniel and Malisiewicz, Tomasz and Rabinovich, Andrew},
+  title={{SuperPoint: Self-Supervised Interest Point Detection and Description}},
+  booktitle={Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition Workshops},
+  year={2018},
+  pages={224--236}
+}
+
+@inproceedings{Dusmanu2019D2Net,
+  author={Dusmanu, Mihai and Rocco, Ignacio and Pajdla, Tomas and Pollefeys, Marc and Sivic, Josef and Torii, Akihiko and Sattler, Torsten},
+  title={{D2-Net: A Trainable CNN for Joint Description and Detection of Local Features}},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2019},
+  pages={8092--8101}
+}
+
+@inproceedings{Ding2021RepVGG,
+  author={Ding, Xiaohan and Zhang, Xiangyu and Ma, Ningning and Han, Jungong and Ding, Guiguang and Sun, Jian},
+  title={{RepVGG: Making VGG-Style ConvNets Great Again}},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2021},
+  pages={13733--13742}
+}
+
+@inproceedings{Revaud2019R2D2,
+ author = {Revaud, Jerome and De Souza, Cesar and Humenberger, Martin and Weinzaepfel, Philippe},
+ booktitle = {Advances in Neural Information Processing Systems},
+ publisher = {Curran Associates, Inc.},
+ title = {{R2D2}: Reliable and Repeatable Detector and Descriptor},
+ volume = {32},
+ year = {2019}
+}
+
+@inproceedings{Tyszkiewicz2020DISK,
+ author = {Tyszkiewicz, Micha\l  and Fua, Pascal and Trulls, Eduard},
+ booktitle = {Advances in Neural Information Processing Systems},
+ pages = {14254--14265},
+ publisher = {Curran Associates, Inc.},
+ title = {{DISK}: Learning local features with policy gradient},
+ volume = {33},
+ year = {2020}
+}
+
+@article{Zhao2023ALIKE,
+  author={Zhao, Xiaoming and Wu, Xingming and Miao, Jinyu and Chen, Weihai and Chen, Peter C. Y. and Li, Zhengguo},
+  title={{ALIKE: Accurate and Lightweight Keypoint Detection and Descriptor Extraction}},
+  journal={IEEE Transactions on Multimedia},
+  year={2023},
+  volume={25},
+  pages={3101--3112},
+  doi={10.1109/tmm.2022.3155927}
+}
+
+@inproceedings{Toft2020DepthMatching,
+  author={Toft, Carl and Turmukhambetov, Daniyar and Sattler, Torsten and Kahl, Fredrik and Brostow, Gabriel J.},
+  title={Single-Image Depth Prediction Makes Feature Matching Easier},
+  booktitle={Computer Vision -- ECCV 2020},
+  year={2020},
+  pages={473--492},
+  doi={10.1007/978-3-030-58517-4_28}
+}
+
+@article{Zhai2021AFT,
+  author={Zhai, Shuangfei and Talbott, Walter and Srivastava, Nitish and Huang, Chen and Goh, Hanlin and Zhang, Ruixiang and Susskind, Josh},
+  title={{An Attention Free Transformer}},
+  journal={arXiv preprint arXiv:2105.14103},
+  year={2021},
+  url={https://arxiv.org/abs/2105.14103}
+}
+
+@article{Lin2025DepthAnything3,
+  author={Lin, Haotong and Chen, Sili and Liew, Junhao and Chen, Donny Y. and Li, Zhenyu and Shi, Guang and Feng, Jiashi and Kang, Bingyi},
+  title={{Depth Anything 3: Recovering the Visual Space from Any Views}},
+  journal={arXiv preprint arXiv:2511.10647},
+  year={2025},
+  url={https://arxiv.org/abs/2511.10647}
+}
+
+@article{Sun2026GeomEff,
+  author={Sun, Libo and Yan, Yidong and Yang, Wenqi and Qin, Wenhu},
+  title={3D Geometry-Aware Efficient Feature Matching for Weakly Textured Scenes},
+  journal={Journal of Imaging},
+  volume={12},
+  number={6},
+  pages={253},
+  year={2026},
+  doi={10.3390/jimaging12060253}
+}
+
+@article{Deng2026GCANet,
+  author={Deng, Yujuan and Tian, Liang and Hou, Xiaohui and Zhao, Xiaoling and Wang, Yonggang and Liu, Xin and Liu, Xingchao and Liao, Chunyuan},
+  title={{GCA-Net}: Geometric-Contextual Alignment Network for Lightweight and Robust Local Feature Extraction in Visual Localization},
+  journal={Applied Sciences},
+  volume={16},
+  number={7},
+  pages={3330},
+  year={2026},
+  doi={10.3390/app16073330}
+}
+
+@article{Chen2026GLAFE,
+  author={Chen, Yuan and Jiang, Jie},
+  title={{GLAFE}: A Global-Local Feature Learning Self-Attention Encoder for {UAV} Relocalization in Weak-Texture Environments},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={4},
+  pages={5151--5157},
+  year={2026},
+  doi={10.1109/LRA.2026.3668451}
+}
+
+@article{Yao2026RotationBinary,
+  author={Yao, Haodi and He, Fenghua and Hao, Ning},
+  title={Learning Rotation-Aware Binary Descriptors for Visual Localization},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={3},
+  pages={3119--3126},
+  year={2026},
+  doi={10.1109/LRA.2026.3655279}
+}
+
+@article{Zhu2026GeoFusion,
+  author={Zhu, Ying and Tan, Kehui and Liu, Hong},
+  title={{GeoFusion}: Geometric Consensus Learning and Anchored Feature Fusion for Multi-View Depth Estimation},
+  journal={IEEE Robotics and Automation Letters},
+  volume={11},
+  number={9},
+  pages={10641--10648},
+  year={2026},
+  doi={10.1109/LRA.2026.3713729}
+}
+
+@misc{Li2026SURE,
+  author={Li, Sicheng and Gu, Zaiwang and Zhang, Jie and Guo, Qing and Jiang, Xudong and Cheng, Jun},
+  title={{SURE}: Semi-Dense Uncertainty-REfined Feature Matching},
+  year={2026},
+  eprint={2603.04869},
+  archivePrefix={arXiv},
+  doi={10.48550/arXiv.2603.04869}
+}
+
+@misc{Ge2026REDIMatch,
+  author={Ge, Yinji and Zheng, Guixu and Guo, Wulong and Feng, Qian and Wu, X. and Zhou, Kai and Liu, Xinyuan and Xing, Fei},
+  title={{REDI-Match}: Rotation-Equivariant Distillation for Efficient and Robust Dense Matching},
+  year={2026},
+  eprint={2606.24330},
+  archivePrefix={arXiv},
+  doi={10.48550/arXiv.2606.24330}
+}
+
+@misc{Hines2026EventGeM,
+  author={Hines, Adam D. and others},
+  title={{EventGeM}: Global-to-Local Feature Matching for Event-Based Visual Place Recognition},
+  year={2026},
+  eprint={2603.05807},
+  archivePrefix={arXiv},
+  doi={10.48550/arXiv.2603.05807}
+}
+
+@inproceedings{Ilter2024SemanticMatching,
+  author={Ilter, Oguzhan and Armeni, Iro and Pollefeys, Marc and Barath, Daniel},
+  title={Semantically Guided Feature Matching for Visual {SLAM}},
+  booktitle={2024 IEEE International Conference on Robotics and Automation (ICRA)},
+  year={2024},
+  pages={12013--12019},
+  doi={10.1109/ICRA57147.2024.10610238}
+}
+
+@inproceedings{Han2024TP3M,
+  author={Han, Liming and Liu, Zhaoxiang and Lian, Shiguo},
+  title={{TP3M}: Transformer-based Pseudo {3D} Image Matching with Reference Image},
+  booktitle={2024 IEEE International Conference on Robotics and Automation (ICRA)},
+  year={2024},
+  pages={3962--3968},
+  doi={10.1109/ICRA57147.2024.10610556}
+}
+
+@inproceedings{Chen2024NeRFMatching,
+  author={Chen, Ronghan and Cong, Yang and Ren, Yu},
+  title={Marrying {NeRF} with Feature Matching for One-step Pose Estimation},
+  booktitle={2024 IEEE International Conference on Robotics and Automation (ICRA)},
+  year={2024},
+  pages={7302--7309},
+  doi={10.1109/ICRA57147.2024.10610766}
+}
+
+@inproceedings{Sun2021LoFTR,
+  author={Sun, Jiaming and Shen, Zehong and Wang, Yuang and Bao, Hujun and Zhou, Xiaowei},
+  title={{LoFTR}: Detector-Free Local Feature Matching with Transformers},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2021},
+  pages={8922--8931}
 }

@@ -49,22 +49,8 @@ class InterpolateSparse2d(nn.Module):
 
 REQUIRED_MODEL_CONFIG_KEYS = {
 	"backbone",
-	"keypoint_encoder",
 	"keypoint_dim",
-	"descriptor_encoder",
 	"descriptor_dim",
-	"geometric_features",
-	"depth_encoder",
-	"depth_dim",
-	"gradient_encoder",
-	"gradient_dim",
-	"curvature_encoder",
-	"curvature_dim",
-	"repeatability_alpha",
-	"attention_layers",
-	"refiner_type",
-	"last_activation",
-	"output_dim",
 }
 
 
@@ -86,127 +72,28 @@ def validate_model_config(model_config: Optional[dict]) -> dict:
 		)
 
 	cfg = dict(model_config)
+	cfg["refiner_type"] = "GCDR"
+	cfg["geometric_features"] = {
+		"depth": True,
+		"gradients": True,
+		"normals": True,
+		"curvatures": True,
+	}
 	geo_cfg = cfg["geometric_features"]
 	if not isinstance(geo_cfg, dict):
 		raise ValueError("model_config['geometric_features'] must be a dict")
 
 	geo_cfg = dict(geo_cfg)
-	for key in ("depth", "gradients", "curvatures"):
+	for key in ("depth", "gradients", "normals", "curvatures"):
 		if key not in geo_cfg:
 			raise ValueError(f"model_config['geometric_features'] missing key: {key}")
-	geo_cfg.setdefault("normal", False)
 	cfg["geometric_features"] = geo_cfg
 
 	return cfg
 
 
-def normalize_legacy_model_config(model_config: Optional[dict], state_dict: Optional[dict] = None) -> dict:
-	"""Patch older config snapshots so evaluation/inference can load archived checkpoints."""
-	if model_config is None:
-		raise ValueError("model_config is required, got None")
-	if not isinstance(model_config, dict):
-		raise TypeError(f"model_config must be a dict, got {type(model_config)}")
-
-	cfg = dict(model_config)
-	fallbacks = {
-		"repeatability_alpha": 0.0,
-		"geo_preprocess_mode": "no_unfold_lite",
-		"aft_config": {
-			"num_groups": 4,
-			"local_kernel_sizes": [3, 5, 7],
-			"domain_adapt": True,
-			"temperature_min": 0.70,
-			"temperature_max": 1.60,
-			"local_base_gain": 1.0,
-			"corr_base_gain": 0.5,
-		},
-		"geo_reliability_gate": {
-			"enabled": False,
-			"hidden_dim": 12,
-			"gate_floor": 0.20,
-			"bias_init": 2.0,
-			"fusion_gain": 0.50,
-		},
-	}
-	for key, value in fallbacks.items():
-		if key not in cfg:
-			cfg[key] = value
-			print(f"Warning: model_config missing '{key}'; fallback to {value!r}.")
-	cfg.setdefault("gcdr_config", {})
-	cfg.setdefault("loss_config", {})
-	if "backbone_channels" not in cfg:
-		if int(cfg["descriptor_dim"]) >= 128:
-			cfg["backbone_channels"] = [32, 32, 64, 128, 128]
-		else:
-			cfg["backbone_channels"] = [20, 20, 40, 80, 96]
-	if "head_in_channels" not in cfg and isinstance(state_dict, dict):
-		head_weight = state_dict["keypoint_head.layer1.layer.0.weight"] if "keypoint_head.layer1.layer.0.weight" in state_dict else None
-		if head_weight is not None and getattr(head_weight, "shape", None) is not None:
-			cfg["head_in_channels"] = int(head_weight.shape[1])
-	if "descriptor_head_channels" not in cfg and isinstance(state_dict, dict):
-		desc_key = "descriptor_head.layer.0.layer.0.weight"
-		desc_weight = state_dict[desc_key] if desc_key in state_dict else None
-		if desc_weight is not None and getattr(desc_weight, "shape", None) is not None:
-			cfg["descriptor_head_channels"] = [int(desc_weight.shape[0]), 64]
-	if "keypoint_head_channels" not in cfg and isinstance(state_dict, dict):
-		kpt_channels = []
-		for layer_idx in range(1, 6):
-			kpt_key = f"keypoint_head.layer{layer_idx}.layer.0.weight"
-			kpt_weight = state_dict[kpt_key] if kpt_key in state_dict else None
-			if kpt_weight is not None and getattr(kpt_weight, "shape", None) is not None:
-				kpt_channels.append(int(kpt_weight.shape[0]))
-		if kpt_channels:
-			cfg["keypoint_head_channels"] = kpt_channels
-	geo_cfg = cfg["geometric_features"]
-	if isinstance(geo_cfg, dict):
-		geo_cfg = dict(geo_cfg)
-		geo_cfg.setdefault("normal", False)
-		if bool(geo_cfg["normal"]):
-			# Old checkpoints used a standalone normal branch while the current
-			# mainline packs normals into gradients. Preserve the checkpoint's
-			# real contract when its weights prove it was trained that way.
-			legacy_grad_key = "attn_fusion.geo_encoders.gradients.encoder.0.weight"
-			legacy_grad_weight = state_dict[legacy_grad_key] if isinstance(state_dict, dict) and legacy_grad_key in state_dict else None
-			legacy_standalone_normal = (
-				legacy_grad_weight is not None
-				and getattr(legacy_grad_weight, "shape", None) is not None
-				and int(legacy_grad_weight.shape[1]) in (2, 128)
-			)
-			if not legacy_standalone_normal:
-				geo_cfg["gradients"] = True
-				geo_cfg["normal"] = False
-		cfg["geometric_features"] = geo_cfg
-	gate_cfg = cfg["geo_reliability_gate"]
-	if isinstance(gate_cfg, dict):
-		gate_cfg = dict(gate_cfg)
-		gate_cfg.setdefault("fusion_gain", 0.50)
-		cfg["geo_reliability_gate"] = gate_cfg
-	gcdr_cfg = cfg["gcdr_config"]
-	if isinstance(gcdr_cfg, dict):
-		gcdr_cfg = dict(gcdr_cfg)
-		gcdr_cfg.setdefault("residual_clip", 0.25)
-		gcdr_cfg.setdefault("complementarity_enabled", False)
-		gcdr_cfg.setdefault("texture_kernel_size", 5)
-		gcdr_cfg.setdefault("texture_temperature", 8.0)
-		gcdr_cfg.setdefault("complementarity_floor", 0.25)
-		cfg["gcdr_config"] = gcdr_cfg
-	loss_cfg = cfg["loss_config"]
-	if isinstance(loss_cfg, dict):
-		loss_cfg = dict(loss_cfg)
-		loss_cfg.setdefault("descriptor_protect_weight", 0.0)
-		loss_cfg.setdefault("reliable_enhance_margin", 0.02)
-		loss_cfg.setdefault("reliable_enhance_weight", 0.0)
-		loss_cfg.setdefault("reliable_enhance_threshold", 0.60)
-		loss_cfg.setdefault("reliable_enhance_quantile", 0.50)
-		loss_cfg.setdefault("unreliable_suppress_weight", 0.0)
-		loss_cfg.setdefault("unreliable_suppress_threshold", 0.45)
-		loss_cfg.setdefault("unreliable_suppress_quantile", 0.25)
-		cfg["loss_config"] = loss_cfg
-	return cfg
-
-
-def load_model_config_snapshot(snapshot_path: str, state_dict: Optional[dict] = None) -> dict:
-	"""Load and normalize a config snapshot produced by training."""
+def load_model_config_snapshot(snapshot_path: str) -> dict:
+	"""Load and strictly validate a complete config snapshot."""
 	if not os.path.isfile(snapshot_path):
 		raise FileNotFoundError(f"Config snapshot not found: {snapshot_path}")
 
@@ -214,7 +101,7 @@ def load_model_config_snapshot(snapshot_path: str, state_dict: Optional[dict] = 
 		payload = json.load(handle)
 	if isinstance(payload, dict) and "model_config" in payload:
 		payload = payload["model_config"]
-	return normalize_legacy_model_config(payload, state_dict=state_dict)
+	return validate_model_config(payload)
 
 
 def load_model_config_for_weights(weight_path: str) -> dict:
@@ -222,10 +109,7 @@ def load_model_config_for_weights(weight_path: str) -> dict:
 	if not weight_path:
 		raise ValueError("weight_path is required to locate config_snapshot.json")
 	snapshot_path = os.path.join(os.path.dirname(os.path.abspath(weight_path)), "config_snapshot.json")
-	state_dict = None
-	if os.path.isfile(weight_path):
-		state_dict = _read_checkpoint_state_dict(weight_path)
-	return load_model_config_snapshot(snapshot_path, state_dict=state_dict)
+	return load_model_config_snapshot(snapshot_path)
 
 
 def _read_checkpoint_state_dict(weight_path: str) -> dict:
@@ -425,26 +309,26 @@ class GeoFeat:
 		if not need_refined_desc and not need_refined_kpt:
 			return raw_descs_map, raw_heatmap
 
-		stage2 = self.net.forward2(kpt_logits, descs_raw, geo_feats, return_refined_keypoints=True)
+		stage2 = self.net.forward2(kpt_logits, descs_raw, geo_feats, return_logits=True)
 		if isinstance(stage2, (tuple, list)) and len(stage2) == 2:
-			descs_refined, kpt_logits_refined = stage2
+			desc, kpt_logits = stage2
 		else:
 			raise RuntimeError(
-				"GeoFeatModel.forward2 must return (descriptors_refined, keypoint_logits_refined) "
-				"when return_refined_keypoints=True."
+				"GeoFeatModel.forward2 must return (desc, kpt_logits) "
+				"when return_logits=True."
 			)
 
-		if descs_refined.dim() != 4:
+		if desc.dim() != 4:
 			raise RuntimeError(
-				f"Expected descriptors_refined as [B, C, H, W], got shape={tuple(descs_refined.shape)}"
+				f"Expected desc as [B, C, H, W], got shape={tuple(desc.shape)}"
 			)
-		if kpt_logits_refined.dim() != 4:
+		if kpt_logits.dim() != 4:
 			raise RuntimeError(
-				f"Expected keypoint_logits_refined as [B, C, H, W], got shape={tuple(kpt_logits_refined.shape)}"
+				f"Expected kpt_logits as [B, C, H, W], got shape={tuple(kpt_logits.shape)}"
 			)
 
-		descs_map = raw_descs_map if self.descriptor_source == "raw" else F.normalize(descs_refined, p=2, dim=1)
-		heatmap = raw_heatmap if self.keypoint_source == "raw" else self._build_heatmap_from_logits(kpt_logits_refined)
+		descs_map = raw_descs_map if self.descriptor_source == "raw" else F.normalize(desc, p=2, dim=1)
+		heatmap = raw_heatmap if self.keypoint_source == "raw" else self._build_heatmap_from_logits(kpt_logits)
 		return descs_map, heatmap
 
 	@staticmethod

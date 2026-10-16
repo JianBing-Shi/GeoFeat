@@ -149,6 +149,10 @@ if __name__ == "__main__":
         cfg = get_cfg_defaults()
         cfg.merge_from_file(args.config_file)
         model_config = get_model_config(cfg)
+        # Yacs decodes the YAML string "None" as Python None on merge.
+        # The model's activation selector expects the literal string.
+        if model_config.get('last_activation') is None:
+            model_config['last_activation'] = 'None'
         print(f"Using override model config: {os.path.abspath(args.config_file)}")
         print("Checkpoint weights will be loaded with relaxed shape-compatible matching.")
     else:

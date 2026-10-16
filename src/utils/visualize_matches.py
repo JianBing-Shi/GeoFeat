@@ -41,7 +41,7 @@ def simple_nms(scores, nms_radius: int):
 
 def extract_features(model, img_tensor, top_k=1000, detection_threshold=0.01):
     with torch.no_grad():
-        descs_refine, des_map, keypoint_map, geo_features = model(img_tensor)
+        desc, keypoint_map, des_map, geo_map = model(img_tensor)
         
         # Process keypoints
         score_map = torch.sigmoid(keypoint_map)
@@ -56,9 +56,9 @@ def extract_features(model, img_tensor, top_k=1000, detection_threshold=0.01):
         kpts = torch.stack([x, y], dim=-1).float() # (B, K, 2)
         
         # Sample descriptors
-        # descs_refine is (B, C, H/8, W/8) -> need to interpolate or sample?
+        # desc is (B, C, H/8, W/8) -> need to interpolate or sample?
         # Wait, GeoFeat output shape depends on architecture.
-        # Let's assume descs_refine is dense map.
+        # Let's assume desc is dense map.
         
         # Grid sample descriptors at keypoint locations
         # Normalize coordinates to [-1, 1]
@@ -68,7 +68,7 @@ def extract_features(model, img_tensor, top_k=1000, detection_threshold=0.01):
         kpts_norm = kpts_norm.unsqueeze(2) # (B, K, 1, 2)
         
         desc_samples = torch.nn.functional.grid_sample(
-            descs_refine, kpts_norm, mode='bilinear', align_corners=True
+            desc, kpts_norm, mode='bilinear', align_corners=True
         ) # (B, C, K, 1)
         
         desc_samples = desc_samples.squeeze(3).transpose(1, 2) # (B, K, C)

@@ -17,6 +17,7 @@ weights_0501/*
 weights_0520/*
 weights_0601/*
 weights_0830/*
+weights_1001/*
 
 # onnx models
 *.onnx
@@ -30,9 +31,6 @@ results/
 
 # external modules
 LiftFeat/
-HS-FPN/
-xfeat/
-LoFTR/
 EfficientLoFTR/
 
 # output file	
@@ -41,7 +39,6 @@ output/
 # tools file
 tools/
 
-docs/
-legacy/
+paper/
 
 linux/
