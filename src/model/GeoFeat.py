@@ -21,7 +21,7 @@ import lightning.pytorch as pl
 import sys
 from typing import List, Tuple, Optional
 from src.loss.loss import GeoFeatLoss, get_loss_config
-from src.data import megadepth_wrapper
+from src.datamodule import megadepth_wrapper
 from src.utils.alike_wrapper import ALikeExtractor
 from src.utils.depth_anything_wrapper import DepthAnythingExtractor
 from src.model.GeometricExtractor import GeometricExtractor

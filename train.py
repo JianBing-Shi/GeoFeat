@@ -5,7 +5,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
-from src.data import GeoFeatDataModule
+from src.datamodule import GeoFeatDataModule
 from src.model import GeoFeat
 from src.config import load_config
 
